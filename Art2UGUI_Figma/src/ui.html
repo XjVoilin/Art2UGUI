@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: Inter, system-ui, sans-serif;
+      font-size: 12px;
+      color: #333;
+      padding: 12px;
+      background: #fff;
+    }
+    h2 { font-size: 14px; margin-bottom: 8px; }
+    .info {
+      background: #f5f5f5;
+      border-radius: 4px;
+      padding: 8px;
+      margin-bottom: 12px;
+      line-height: 1.5;
+      color: #666;
+    }
+    .controls {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    .controls label {
+      font-weight: 500;
+      white-space: nowrap;
+    }
+    .controls select {
+      flex: 1;
+      height: 28px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      padding: 0 8px;
+      font-size: 12px;
+    }
+    button {
+      width: 100%;
+      height: 36px;
+      background: #18A0FB;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:hover { background: #0d8de5; }
+    button:disabled { background: #ccc; cursor: not-allowed; }
+    #log {
+      margin-top: 12px;
+      max-height: 240px;
+      overflow-y: auto;
+      font-family: monospace;
+      font-size: 11px;
+      white-space: pre-wrap;
+      line-height: 1.4;
+    }
+    .error { color: #f24822; }
+    .success { color: #1bc47d; }
+  </style>
+</head>
+<body>
+  <h2>Art2UGUI Export</h2>
+  <div class="info">
+    选中顶层 Frame，点击导出。输出 ZIP 包含 JSON + 所有切图 PNG。<br>
+    前缀：btn_ / img_ / icon_ / slider_ / sliderfill_ / bg_ / mask_ / tile_<br>
+    后缀：<code>$</code>=原始尺寸 <code>%</code>=九宫格 <code>#</code>=忽略 <code>@</code>=Prefab <code>~</code>=Tint(白图+颜色)<br>
+    无前缀节点不导出，TEXT 节点始终导出为文字数据。
+  </div>
+  <div class="controls">
+    <label for="scaleSelect">导出倍率：</label>
+    <select id="scaleSelect">
+      <option value="1" selected>1x</option>
+      <option value="2">2x</option>
+      <option value="3">3x</option>
+      <option value="4">4x</option>
+    </select>
+  </div>
+  <button id="exportBtn">导出 ZIP (JSON + PNGs)</button>
+  <div id="log"></div>
+
+  <script>
+    const exportBtn = document.getElementById('exportBtn');
+    const logDiv = document.getElementById('log');
+    const scaleSelect = document.getElementById('scaleSelect');
+
+    exportBtn.addEventListener('click', () => {
+      exportBtn.disabled = true;
+      exportBtn.textContent = '导出中...';
+      logDiv.innerHTML = '';
+      const scale = parseInt(scaleSelect.value, 10);
+      parent.postMessage({ pluginMessage: { type: 'export', scale: scale } }, '*');
+    });
+
+    window.onmessage = (event) => {
+      const msg = event.data.pluginMessage;
+      if (!msg) return;
+
+      if (msg.type === 'log') {
+        const span = document.createElement('span');
+        span.textContent = msg.text + '\n';
+        if (msg.level === 'error') span.className = 'error';
+        if (msg.level === 'success') span.className = 'success';
+        logDiv.appendChild(span);
+      }
+
+      if (msg.type === 'done' || msg.type === 'error') {
+        exportBtn.disabled = false;
+        exportBtn.textContent = '导出 ZIP (JSON + PNGs)';
+      }
+
+      if (msg.type === 'save-zip') {
+        const bytes = new Uint8Array(msg.bytes);
+        const blob = new Blob([bytes], { type: 'application/zip' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = msg.fileName;
+        a.click();
+        URL.revokeObjectURL(url);
+      }
+
+      // Legacy JSON-only download support
+      if (msg.type === 'save-file') {
+        const blob = new Blob([msg.content], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = msg.fileName;
+        a.click();
+        URL.revokeObjectURL(url);
+      }
+    };
+  </script>
+</body>
+</html>

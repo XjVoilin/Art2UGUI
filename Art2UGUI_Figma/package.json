@@ -1,0 +1,17 @@
+{
+  "name": "figma2ugui",
+  "version": "1.0.0",
+  "description": "Export Figma layers to JSON for Unity PS2UGUI pipeline",
+  "scripts": {
+    "build": "esbuild src/code.ts --bundle --outfile=dist/code.js --target=es6",
+    "watch": "esbuild src/code.ts --bundle --outfile=dist/code.js --target=es6 --watch"
+  },
+  "devDependencies": {
+    "@figma/plugin-typings": "^1.100.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "jszip": "^3.10.1"
+  }
+}

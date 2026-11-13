@@ -3,7 +3,7 @@
  * Photoshop ExtendScript - 导出 PSD 为 JSON + PNG（对齐 Art2UGUI Figma 插件）
  *
  * 使用方法：在 Photoshop 中 文件 → 脚本 → 浏览，选择此文件
- * 输出：在 PSD 同目录的 {名称}/ 中生成 {名称}_ui_data.json 和对应 PNG 文件
+ * 输出：在 PSD 同目录的 {PSD名或选中组名}/ 中生成同名 JSON 和对应 PNG 文件
  * 默认按 PSD 原像素尺寸导出，节点 ^N 仅改变 PNG 分辨率，布局尺寸不变
  * 透明留边：可选 0/1/2px（默认 1px），随最终倍率缩放且至少保留 1 个透明像素
  *
@@ -50,8 +50,9 @@
         return;
     }
 
-    var exportPadding = selectExportPadding();
-    if (exportPadding === null) return;
+    var exportOptions = selectExportOptions();
+    if (exportOptions === null) return;
+    var exportPadding = exportOptions.padding;
 
     var canvasWidth = Math.round(doc.width.as("px"));
     var canvasHeight = Math.round(doc.height.as("px"));
@@ -66,24 +67,61 @@
 
     // ========== 工具函数 ==========
 
-    function selectExportPadding() {
+    function selectedGroupProblem(group) {
+        if (!group || group.typename !== "LayerSet" || group.parent.typename !== "Document") {
+            return "请在图层面板选中一个顶层组本身。";
+        }
+        var name = group.name;
+        if (!name || name.charAt(0) === "#" || name === "." || name === ".." ||
+            /[\\\/:*?"<>|\x00-\x1f]/.test(name) || /[. ]$/.test(name) ||
+            /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(name)) {
+            return "组名需要能作为独立文件夹名称，且不能以 # 开头。";
+        }
+        var count = 0;
+        for (var i = 0; i < doc.layers.length; i++) {
+            if (doc.layers[i].typename === "LayerSet" && doc.layers[i].name.toLowerCase() === name.toLowerCase()) count++;
+        }
+        if (count > 1) return "存在同名顶层组，请先为面板设置唯一名称。";
+        var desc = getLayerDescriptor(group);
+        if (desc.hasKey(stringIDToTypeID("artboardEnabled")) && desc.getBoolean(stringIDToTypeID("artboardEnabled"))) {
+            return "当前选组导出用于共用 PSD 画布的普通组，暂不支持独立画板。";
+        }
+        return null;
+    }
+
+    function selectExportOptions() {
+        var selectedGroup = doc.activeLayer;
+        var groupProblem = selectedGroupProblem(selectedGroup);
         var dialog = new Window("dialog", "Art2UGUI 导出");
         dialog.orientation = "column";
         dialog.alignChildren = "fill";
         dialog.margins = 16;
         dialog.spacing = 12;
-        addHelpText(dialog, "导出当前 PSD 的 JSON + PNG，保存到 PSD 同名目录。", 36);
+        addHelpText(dialog, "导出 JSON + PNG，在 PSD 所在目录生成 PSD 或选中组的同名文件夹。", 36);
         addNamingRules(dialog);
         var paddingRow = dialog.add("group");
         paddingRow.add("statictext", undefined, "透明留边：");
         var padding = paddingRow.add("dropdownlist", undefined, ["无", "1px", "2px"]);
         padding.selection = 1;
         addHelpText(dialog, "默认按原尺寸导出，用节点 ^0.5 单独缩图。\n留边随节点倍率缩放，至少保留 1 个透明像素。", 44);
+        addHelpText(dialog, groupProblem ? "选中组导出不可用：" + groupProblem :
+            "当前选中组：" + selectedGroup.name + (selectedGroup.visible ? "" : "（隐藏，可独立导出）"), 36);
+        addHelpText(dialog, "选组导出沿用 PSD 画布和坐标，只包含组内内容。", 24);
         var buttons = dialog.add("group");
         buttons.alignment = "right";
         buttons.add("button", undefined, "取消", { name: "cancel" });
-        buttons.add("button", undefined, "导出", { name: "ok" });
-        return dialog.show() === 1 ? padding.selection.index : null;
+        var wholeButton = buttons.add("button", undefined, "导出整个 PSD", { name: "ok" });
+        var groupButton = buttons.add("button", undefined, "导出选中组");
+        wholeButton.onClick = function () { dialog.close(1); };
+        groupButton.onClick = function () { dialog.close(2); };
+        groupButton.enabled = groupProblem === null;
+        var result = dialog.show();
+        if (result !== 1 && result !== 2) return null;
+        if (result === 2 && groupProblem !== null) {
+            alert("PS2UGUI: " + groupProblem);
+            return null;
+        }
+        return { padding: padding.selection.index, group: result === 2 ? selectedGroup : null };
     }
 
     function addHelpText(parent, text, height) {
@@ -695,10 +733,16 @@
 
     function runExport() {
         var startTime = new Date().getTime();
-        traverseLayers(doc, "");
+        var panel = exportOptions.group;
+        // The selected group is a panel container. Its hidden state is intentionally
+        // ignored without mutating it; hidden descendants retain the normal rules.
+        traverseLayers(panel || doc, "");
+        if (panel && layers.length === 0) throw new Error("选中组没有符合命名规则的可导出图层。");
+        if (panel && pngExportList.length === 0) warnings.push("本次仅导出文字，未发现带 img_/btn_ 等前缀的图片；如需切图，请先整理图片命名。");
         validateSpritePaths();
         var docName = doc.name.replace(/\.[^.]+$/, "");
-        var outputDir = docPath + "/" + docName;
+        var exportName = panel ? panel.name : docName;
+        var outputDir = docPath + "/" + exportName;
         var outputData = { schemaVersion: 2,
             canvas: { width: canvasWidth, height: canvasHeight }, layers: layers };
         ensureFolder(outputDir);
@@ -713,7 +757,7 @@
 
         // 组的真实可见边界在切图阶段测得，JSON 必须在边界回写后序列化。
         var jsonString = toJSON(outputData);
-        var jsonFile = new File(outputDir + "/" + docName + "_ui_data.json");
+        var jsonFile = new File(outputDir + "/" + exportName + "_ui_data.json");
         jsonFile.encoding = "UTF-8";
         if (!jsonFile.open("w")) throw new Error("无法写入 JSON: " + jsonFile.error);
         try {
@@ -734,7 +778,8 @@
         var failed = pngExportList.length - pngCount;
         var msg = failed > 0 ? "PS2UGUI: 导出部分完成（有 PNG 失败）\n\n" : "PS2UGUI: 导出完成！\n\n";
         msg += "输出目录: " + outputDir + "\n";
-        msg += "JSON: " + docName + "_ui_data.json\n";
+        msg += "范围: " + (panel ? "选中组 " + panel.name : "整个 PSD") + "\n";
+        msg += "JSON: " + exportName + "_ui_data.json\n";
         msg += "图层数: " + layers.length + "\n";
         msg += "PNG 成功/计划: " + pngCount + "/" + pngExportList.length + "\n";
         msg += "透明留边: " + exportPadding + "px（原尺寸基准）\n";

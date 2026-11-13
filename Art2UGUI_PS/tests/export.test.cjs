@@ -136,12 +136,12 @@ function run(children, options = {}) {
       if (layer.layers) { const found = find(layer, id); if (found) return found; }
     }
   }
-  function materialize(spec, owner, original) {
+  function materialize(spec, owner, original, parent) {
     const layer = { ...clone(spec), bounds: spec.rect.map(n => unit(n)) };
+    Object.defineProperty(layer, 'parent', { value: parent || owner });
     if (spec.text) layer.textItem = { ...spec.text, size: unit(spec.text.size, 'pt') };
     if (spec.children) {
-      layer.layers = spec.children.map(child => materialize(child, owner, original));
-      for (const child of layer.layers) Object.defineProperty(child, 'parent', { value: layer });
+      layer.layers = spec.children.map(child => materialize(child, owner, original, layer));
     }
     layer.duplicate = target => {
       const copy = materialize(spec, target, false);
@@ -160,12 +160,13 @@ function run(children, options = {}) {
     }
     return layer;
   }
-  const doc = { name: 'Screen.psd', width: unit(options.canvasWidth || 800),
+  const doc = { name: 'Screen.psd', typename: 'Document', width: unit(options.canvasWidth || 800),
     height: unit(options.canvasHeight || 600), resolution: options.resolution || 72 };
   if (options.unsaved) Object.defineProperty(doc, 'path', { get() { throw new Error('not saved'); } });
   else doc.path = '/design';
   doc.layers = children.map(child => materialize(child, doc, true));
   doc.activeLayer = doc.layers[0];
+  for (const index of options.selectedPath || []) doc.activeLayer = doc.activeLayer.layers[index];
   const initialSelection = doc.activeLayer;
   const app = { activeDocument: doc, documents: options.noDocument ? [] : [doc], displayDialogs: 'ALL' };
   function makeTemp(spec) {
@@ -213,7 +214,7 @@ function run(children, options = {}) {
     get parent() { return new Folder(path.posix.dirname(this.fsName)); }
     create() { folders.add(this.fsName); return true; }
     execute() {
-      assert.ok(files.has('/design/Screen/Screen_ui_data.json'), 'open output only after JSON is written');
+      assert.ok(files.has(this.fsName + '/' + path.posix.basename(this.fsName) + '_ui_data.json'), 'open output only after JSON is written');
       if (options.throwOpenFolder) throw new Error('file browser unavailable');
       if (options.failOpenFolder) return false;
       openedFolders.push(this.fsName);
@@ -237,7 +238,7 @@ function run(children, options = {}) {
       }
       return this;
     }
-    show() { return options.cancel ? 0 : 1; }
+    show() { return options.cancel ? 0 : options.exportSelected ? 2 : 1; }
   }
   const context = vm.createContext({ app, alert: message => alerts.push(message), File, Folder, Window,
     UnitValue: function(value) { this.value = value; },
@@ -264,7 +265,8 @@ function run(children, options = {}) {
   assert.equal(doc.activeLayer, initialSelection);
   assert.equal(app.displayDialogs, 'ALL');
   assert.ok(temps.every(temp => temp.closed), 'all temporary documents must be closed');
-  const json = files.get('/design/Screen/Screen_ui_data.json');
+  const entry = [...files].find(([name]) => name.endsWith('_ui_data.json'));
+  const json = entry && entry[1];
   return { data: json && JSON.parse(json), alerts, files, pngs, folders, doc, temps, openedFolders };
 }
 
@@ -284,6 +286,49 @@ test('mixed stack traversal extracts nested sprites/text and skips hidden/ignore
   assert.deepEqual([...result.pngs.keys()], ['/design/Screen/btn_ok.png',
     '/design/Screen/icons/icon_star.png', '/design/Screen/img_bottom.png']);
   assert.deepEqual(result.openedFolders, ['/design/Screen']);
+});
+
+test('selected hidden top-level group exports alone with its original canvas and no source mutations', () => {
+  const result = run([group('Win', [image('img_art'), text('Caption'), image('img_hidden', {visible:false})], {visible:false}),
+    group('Lose', [image('img_other')]), image('img_outside')], {exportSelected:true, canvasWidth:1080, canvasHeight:1920});
+  assert.deepEqual(result.data.layers.map(layer => layer.name), ['img_art','Caption']);
+  assert.deepEqual(result.data.canvas, {width:1080,height:1920});
+  assert.equal(result.data.layers[0].groupPath, '');
+  assert.equal(result.data.layers[0].x, 10);
+  assert.equal(result.data.resourceScope, undefined);
+  assert.ok(result.files.has('/design/Win/Win_ui_data.json'));
+  assert.deepEqual([...result.pngs.keys()], ['/design/Win/img_art.png']);
+  assert.equal(result.doc.layers[0].visible, false);
+  assert.deepEqual(result.openedFolders, ['/design/Win']);
+});
+
+test('whole PSD export still ignores a hidden selected group', () => {
+  const result = run([group('Win', [image('img_inside')], {visible:false}), image('img_outside')]);
+  assert.deepEqual(result.data.layers.map(layer => layer.name), ['img_outside']);
+  assert.equal(result.data.resourceScope, undefined);
+});
+
+test('selected export requires a uniquely named ordinary top-level group', () => {
+  const invalid = [
+    [[image('img_art')], {}],
+    [[group('Panel',[group('Nested',[image('img_art')])])], {selectedPath:[0]}],
+    [[group('#Ignore',[image('img_art')])], {}],
+    [[group('Bad/Name',[image('img_art')])], {}],
+    [[group('Panel',[image('img_art')]),group('panel',[image('img_other')])], {}],
+    [[group('Artboard',[image('img_art')], {descriptor:{artboardEnabled:true}})], {}]
+  ];
+  for (const [specs, options] of invalid) {
+    const result = run(specs, {...options, exportSelected:true});
+    assert.equal(result.files.size, 0);
+    assert.equal(result.temps.length, 0);
+  }
+});
+
+test('selected empty group fails before writing, while a text-only group reports its missing image naming', () => {
+  assert.equal(run([group('Empty',[])], {exportSelected:true}).files.size, 0);
+  const result=run([group('TextOnly',[text('Caption')])], {exportSelected:true});
+  assert.equal(result.data.layers.length, 1);
+  assert.match(result.alerts.at(-1), /本次仅导出文字/);
 });
 
 test('parent PNG separates text and all nested sprites including tint nodes', () => {

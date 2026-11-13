@@ -1,6 +1,22 @@
 # Art2UGUI Photoshop 导出
 
-运行 `PS2UGUI_Export.jsx`，将当前 PSD 导出到 PSD 同名目录，完成后自动打开文件夹。PSD 需要保存过；已有未保存编辑可以直接导出。
+运行 `PS2UGUI_Export.jsx`，将整个 PSD 或选中组导出为 JSON + PNG，完成后自动打开文件夹。PSD 需要保存过；已有未保存编辑可以直接导出。
+
+## 一个 PSD 包含多个面板
+
+导出窗口保留 **导出整个 PSD**，另提供 **导出选中组**：
+
+1. 在 PS 图层面板点选一个顶层普通组本身，例如 `胜利`。
+2. 运行菜单脚本，确认窗口显示的当前组名，点击“导出选中组”。
+3. 在 PSD 所在目录直接生成 `胜利/胜利_ui_data.json` 及该面板的 PNG。Unity Art Importer 选择这个 `胜利` 文件夹。
+
+组名直接作为面板名，无需加前缀或后缀；同一 PSD 内需要唯一，且不能包含 Windows 文件名非法字符或以 `#` 开头。图层、嵌套组和独立画板不能使用此按钮。每次导出一个活动组。
+
+选中的顶层组仅作为容器，不生成自己的 PNG。保留 PSD 原画布尺寸和原坐标；隐藏的面板组也能直接导出，不改变源文档显隐，组内隐藏及 `#` 规则仍然生效。组外背景、HUD 等不包含在内，需要导出的内容应放入面板组。
+
+组内图片仍需 `img_`、`btn_` 等前缀；普通装饰应放进带前缀的切图组。只有文字而没有可识别图片时，会明确提示整理图片命名。选择单面板 PSD 时，仍可直接使用“导出整个 PSD”。
+
+本功能只改变 PS 的导出范围、输出目录和 JSON 文件名，沿用原有 JSON 格式与图片路径规则，无需修改 Unity Editor 导入代码。例如 `关卡.psd`、`胜利/`、`失败/` 位于同一目录；单面板 PSD 仍用“导出整个 PSD”输出到 `关卡/`。
 
 ## 使用规则
 
@@ -64,6 +80,8 @@ git diff --check
 该用例先复制 PSD，在 `.tmp/photoshop-rendering-test/` 生成独立的完整渲染参考，再将参考 PNG 裁切、缩放、留边，与生产导出逐像素比较；原 PSD 不修改。
 
 宿主契约测试覆盖遍历、父子分离、Tint、透明度、缩图、留边、路径和错误清理，并执行 Figma 实际导出逻辑比较两端 JSON。`tests/photoshop-export.test.jsx` 在真实 Photoshop 中新建专用 PSD，检查实际 PNG、JSON、原文档历史及活动图层；产物在 `.tmp/photoshop-export-test/`。
+
+`tests/photoshop-panels.test.jsx` 在真实 PS 中创建两个包含同名路径的面板，验证隐藏组独立导出、原画布/坐标、源显隐/历史/选择及临时文档清理；若 `.tmp/MultiPanelInspection.psd` 存在，还验证业务 PSD 的四个面板，副本与结果均写入 `.tmp/photoshop-panels-test/`。
 
 2026-11-13 已在 Photoshop 24.3.0 实测：调整层不再把组撑成整画布；原尺寸、`^0.5`、`^2`、0/1/2px 留边均正确；50% 图层 PNG 内容 Alpha=255、JSON opacity=50；Tint PNG 内容为白色且边缘全透明；旋转智能对象输出渲染矩形、rotationZ=0，含小数留边且原文档历史不变。真实 PS Tint 和旋转产物也进入 Unity 导入回归。倍率符号迁移后 PS 33 项、Figma 15 项（含真实浏览器）、Unity 31 项均通过，包含旧星号拒绝检查；TypeScript 检查和构建通过。
 

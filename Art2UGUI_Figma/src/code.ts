@@ -5,8 +5,11 @@
 // ============================================================================
 
 // Polyfill: Figma sandbox lacks setImmediate which JSZip requires
-if (typeof setImmediate === "undefined") {
-  (globalThis as any).setImmediate = (fn: (...args: any[]) => void, ...args: any[]) => setTimeout(fn, 0, ...args);
+const sandbox = globalThis as typeof globalThis & {
+  setImmediate?: (fn: (...args: unknown[]) => void, ...args: unknown[]) => number;
+};
+if (typeof sandbox.setImmediate === "undefined") {
+  sandbox.setImmediate = (fn, ...args) => setTimeout(() => fn(...args), 0);
 }
 
 import JSZip from "jszip";
@@ -40,11 +43,13 @@ interface PSLayer {
   fontColor?: string;
   fontName?: string;
   textAlignment?: string;
+  wordWrap?: boolean;
   strokeColor?: string;
   strokeWidth?: number;
 }
 
 interface PSData {
+  schemaVersion: 2;
   canvas: PSCanvas;
   layers: PSLayer[];
 }
@@ -52,8 +57,8 @@ interface PSData {
 interface SpriteNode {
   layer: PSLayer;
   figmaNode: SceneNode;
+  rasterScale: number;
   nestedSprites: SpriteNode[];
-  nestedTexts: SceneNode[];
 }
 
 interface ExportedPng {
@@ -69,12 +74,6 @@ interface LayerGeometry {
   rotationZ: number;
 }
 
-interface ScaleResult {
-  x: number;
-  y: number;
-  warning?: string;
-}
-
 const VALID_PREFIXES = [
   "btn_", "img_", "icon_", "slider_", "sliderfill_", "bg_", "mask_", "tile_",
 ];
@@ -83,16 +82,32 @@ const VALID_PREFIXES = [
 // Part 2: Plugin entry and UI communication
 // ---------------------------------------------------------------------------
 
-figma.showUI(__html__, { width: 320, height: 480 });
+figma.showUI(__html__, { width: 360, height: 600 });
 
-figma.ui.onmessage = (msg: { type: string; scale?: number }) => {
+type UiMessage =
+  | { type: "export"; padding: number }
+  | { type: "png-padded"; requestId: number; bytes: Uint8Array }
+  | { type: "png-padding-error"; requestId: number; error: string };
+
+let nextPngRequest = 0;
+const pendingPngs = new Map<number, {
+  resolve: (bytes: Uint8Array) => void;
+  reject: (error: Error) => void;
+}>();
+
+figma.ui.onmessage = (msg: UiMessage) => {
   if (msg.type === "export") {
-    const scale = msg.scale ?? 1;
-    void runExport(scale).catch((error: unknown) => {
+    void runExport(msg.padding).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
       log(`导出失败：${message}`, "error");
       figma.ui.postMessage({ type: "error" });
     });
+  } else if (msg.type === "png-padded" || msg.type === "png-padding-error") {
+    const pending = pendingPngs.get(msg.requestId);
+    if (!pending) throw new Error(`未知 PNG 留边请求: ${msg.requestId}`);
+    pendingPngs.delete(msg.requestId);
+    if (msg.type === "png-padded") pending.resolve(new Uint8Array(msg.bytes));
+    else pending.reject(new Error(msg.error));
   }
 };
 
@@ -113,14 +128,25 @@ function hasValidPrefix(name: string): boolean {
 
 function hasTintSuffix(name: string): boolean {
   const stripped = stripScaleSuffix(name);
-  return stripped.endsWith("~");
+  return /[$%@~]*~[$%@~]*$/.test(stripped);
 }
 
 function stripScaleSuffix(rawName: string): string {
   if (rawName.length === 0) return "";
-  const lastStar = rawName.lastIndexOf("*");
-  if (lastStar === -1) return rawName;
-  return rawName.substring(0, lastStar);
+  const lastCaret = rawName.lastIndexOf("^");
+  if (lastCaret === -1) return rawName;
+  return rawName.substring(0, lastCaret);
+}
+
+function getRasterScale(name: string): number {
+  const lastCaret = name.lastIndexOf("^");
+  if (lastCaret < 0) return 1;
+  const suffix = name.substring(lastCaret + 1);
+  const scale = Number(suffix);
+  if (!/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(suffix) || !Number.isFinite(scale) || scale <= 0) {
+    throw new Error(`节点 PNG 倍率必须是正数，例如 img_logo^0.5: ${name}`);
+  }
+  return scale;
 }
 
 function stripAllSuffixes(rawName: string): string {
@@ -202,7 +228,7 @@ async function traverseChildren(
   warnings: Set<string>,
 ): Promise<void> {
   const children = parent.children;
-  // Reverse iterate: last child (bottom-most in Figma visual stack) first
+  // Figma children are back-to-front: visit the topmost child first.
   for (let i = children.length - 1; i >= 0; i--) {
     const child = children[i];
 
@@ -228,8 +254,8 @@ async function traverseChildren(
       const spriteNode: SpriteNode = {
         layer: layerData,
         figmaNode: child,
+        rasterScale: getRasterScale(child.name),
         nestedSprites: [],
-        nestedTexts: [],
       };
 
       // If has children, recurse to find nested prefixed nodes and TEXT
@@ -297,7 +323,6 @@ async function collectNestedContent(
       const layerData = await extractLayerData(child, groupPath, canvasX, canvasY, counter, warnings);
       if (layerData) {
         layers.push(layerData);
-        parentSprite.nestedTexts.push(child);
       }
       continue;
     }
@@ -310,8 +335,8 @@ async function collectNestedContent(
       const nestedSprite: SpriteNode = {
         layer: layerData,
         figmaNode: child,
+        rasterScale: getRasterScale(child.name),
         nestedSprites: [],
-        nestedTexts: [],
       };
 
       if ("children" in child) {
@@ -355,8 +380,9 @@ async function extractLayerData(
   warnings: Set<string>,
 ): Promise<PSLayer | null> {
   const isText = node.type === "TEXT";
-  const geometry = getLayerGeometry(node, canvasX, canvasY);
-  const opacity = Math.round(("opacity" in node ? (node.opacity as number) : 1) * 100);
+  if (!isText) getSpriteFileName(node.name);
+  const geometry = isText ? getLayerGeometry(node, canvasX, canvasY) : getRasterGeometry(node, canvasX, canvasY);
+  const opacity = getEffectiveOpacity(node);
 
   const data: PSLayer = {
     id: counter.id++,
@@ -375,13 +401,6 @@ async function extractLayerData(
     rotationZ: geometry.rotationZ,
   };
 
-  const scale = await getNodeScale(node);
-  data.scaleX = scale.x;
-  data.scaleY = scale.y;
-  if (scale.warning) {
-    warnings.add(scale.warning);
-  }
-
   if (isText && node.type === "TEXT") {
     const textNode = node as TextNode;
     data.text = textNode.characters;
@@ -394,6 +413,9 @@ async function extractLayerData(
         textNode.characters.length > 0 ? textNode.getRangeFontSize(0, 1) : 24;
       data.fontSize = typeof rangeFs === "number" ? rangeFs : 24;
     }
+    const textScale = getTransformScale(node.absoluteTransform);
+    data.fontSize = Math.round(data.fontSize * textScale.y * 10000) / 10000;
+    data.wordWrap = textNode.textAutoResize !== "WIDTH_AND_HEIGHT";
 
     data.fontColor = getTextFillColor(textNode) ?? "#000000";
 
@@ -418,34 +440,49 @@ async function extractLayerData(
     data.strokeColor = getTextStrokeColor(textNode) ?? undefined;
     const sw = textNode.strokeWeight;
     if (typeof sw === "number" && sw > 0) {
-      data.strokeWidth = sw;
+      data.strokeWidth = sw * textScale.y;
     }
   }
 
-  if (!isText) {
-    if (hasTintSuffix(node.name) && "fills" in node) {
-      // Node itself has ~ — use its own color as tint
-      const color = getSolidFillColor(node);
-      if (color) data.fontColor = color;
-    } else {
-      // Check children for ~ suffixed nodes
-      const tintColor = "children" in node ? findTintChildColor(node as SceneNode & ChildrenMixin) : null;
-      if (tintColor) {
-        data.fontColor = tintColor;
-      } else if ("fills" in node) {
-        const color = getSolidFillColor(node);
-        if (color) data.fontColor = color;
-      }
-    }
+  if (!isText && hasTintSuffix(node.name)) {
+    const color = getSolidFillColor(node) ?? ("children" in node ? findTintChildColor(node) : null);
+    if (color) data.fontColor = color;
+    else warnings.add(`Tint 无可读取的纯色色源，保留原图: ${node.name}`);
   }
 
   return data;
 }
 
+function getEffectiveOpacity(node: BaseNode): number {
+  let opacity = 1;
+  let current: BaseNode | null = node;
+  while (current) {
+    if ("opacity" in current) opacity *= (current as SceneNode & { opacity: number }).opacity;
+    current = current.parent;
+  }
+  return Math.round(opacity * 100);
+}
+
+function getRasterGeometry(node: SceneNode, canvasX: number, canvasY: number): LayerGeometry {
+  const bounds = "absoluteRenderBounds" in node ? node.absoluteRenderBounds : null;
+  if (!bounds || bounds.width <= 0 || bounds.height <= 0)
+    throw new Error(`图片没有可导出的渲染边界: ${node.name}`);
+  return { x: bounds.x - canvasX, y: bounds.y - canvasY,
+    width: bounds.width, height: bounds.height, rotationZ: 0 };
+}
+
+function normalizeDegrees(degrees: number): number {
+  let value = degrees % 360;
+  if (value > 180) value -= 360;
+  if (value <= -180) value += 360;
+  return Math.round(value * 10000) / 10000;
+}
+
 function getLayerGeometry(node: SceneNode, canvasX: number, canvasY: number): LayerGeometry {
   const transform = node.absoluteTransform;
-  const width = Math.round(node.width);
-  const height = Math.round(node.height);
+  const scale = getTransformScale(transform);
+  const width = Math.round(node.width * scale.x);
+  const height = Math.round(node.height * scale.y);
   const center = transformPoint(transform, node.width / 2, node.height / 2);
   const rotation = getNodeRotationDegrees(node);
 
@@ -456,6 +493,11 @@ function getLayerGeometry(node: SceneNode, canvasX: number, canvasY: number): La
     height,
     rotationZ: normalizeDegrees(-rotation),
   };
+}
+
+function getTransformScale(transform: Transform): { x: number; y: number } {
+  return { x: Math.hypot(transform[0][0], transform[1][0]),
+    y: Math.hypot(transform[0][1], transform[1][1]) };
 }
 
 function getNodeRotationDegrees(node: SceneNode): number {
@@ -509,66 +551,70 @@ function transformPoint(transform: Transform, x: number, y: number): { x: number
 // Part 7: PNG Export
 // ---------------------------------------------------------------------------
 
-async function exportAllSprites(spriteTree: SpriteNode[], scale: number): Promise<ExportedPng[]> {
+async function exportAllSprites(spriteTree: SpriteNode[], padding: number): Promise<ExportedPng[]> {
   const results: ExportedPng[] = [];
   for (const sprite of spriteTree) {
-    const pngs = await exportSpriteNode(sprite, scale);
+    const pngs = await exportSpriteNode(sprite, padding);
     results.push(...pngs);
   }
   return results;
 }
 
-async function exportSpriteNode(sprite: SpriteNode, scale: number): Promise<ExportedPng[]> {
+async function exportSpriteNode(sprite: SpriteNode, padding: number): Promise<ExportedPng[]> {
   const results: ExportedPng[] = [];
   const node = sprite.figmaNode;
 
-  // Collect nodes to hide: nested prefixed sprites + TEXT children
-  const hidden: { node: SceneNode; was: boolean }[] = [];
-  if ("children" in node) {
-    hideNestedExportables(node as SceneNode & ChildrenMixin, hidden);
-  }
-
-  // Tint: whiten ~ nodes before export
-  const whitened: { node: SceneNode; originalFills: Paint[] }[] = [];
-  if (hasTintSuffix(sprite.layer.name)) {
-    whitenSolidFills(node, whitened);
-  } else if ("children" in node) {
-    findAndWhitenTintChildren(node as SceneNode & ChildrenMixin, whitened);
-  }
-
-  // Export current node
-  if ("exportAsync" in node) {
-    try {
-      const bytes = await (node as ExportMixin).exportAsync({
-        format: "PNG",
-        contentsOnly: true,
-        constraint: { type: "SCALE", value: scale },
-      });
-      const fileName = getSpriteFileName(sprite.layer.name) + ".png";
-      results.push({ fileName, bytes });
-    } catch (e) {
-      log(`[警告] 导出 ${sprite.layer.name} 失败: ${e}`, "error");
-    }
-  }
-
-  // Restore whitened fills
-  for (const w of whitened) {
-    if ("fills" in w.node) {
-      (w.node as GeometryMixin).fills = w.originalFills;
-    }
-  }
-
-  // Restore hidden nodes
-  for (const h of hidden) {
-    (h.node as SceneNode & { visible: boolean }).visible = h.was;
+  // Isolate rendering in a fixed-size frame: native export must not recrop the
+  // PNG when separately exported children are hidden or rotation is baked.
+  if (!("clone" in node) || !("absoluteRenderBounds" in node))
+    throw new Error(`不支持的图片节点: ${node.name}`);
+  const bounds = node.absoluteRenderBounds!;
+  const frame = figma.createFrame();
+  try {
+    frame.fills = [];
+    frame.clipsContent = true;
+    frame.resize(bounds.width, bounds.height);
+    frame.x = bounds.x;
+    frame.y = bounds.y;
+    const copy = node.clone();
+    frame.appendChild(copy);
+    const transform = node.absoluteTransform;
+    copy.relativeTransform = [[transform[0][0], transform[0][1], transform[0][2] - bounds.x],
+      [transform[1][0], transform[1][1], transform[1][2] - bounds.y]];
+    if ("opacity" in copy) copy.opacity = 1;
+    if ("children" in copy) hideNestedExportables(copy, []);
+    let bytes = await frame.exportAsync({ format: "PNG", contentsOnly: true, useAbsoluteBounds: true,
+      constraint: { type: "SCALE", value: sprite.rasterScale } });
+    const pixels = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const width = pixels.getUint32(16);
+    const height = pixels.getUint32(20);
+    const pixelPadding = padding > 0 ? Math.max(1, Math.round(padding * sprite.rasterScale)) : 0;
+    if (pixelPadding > 0 || sprite.layer.fontColor) bytes = await padPng(bytes, pixelPadding, !!sprite.layer.fontColor);
+    const paddingX = pixelPadding * sprite.layer.width / width;
+    const paddingY = pixelPadding * sprite.layer.height / height;
+    sprite.layer.x -= paddingX;
+    sprite.layer.y -= paddingY;
+    sprite.layer.width += paddingX * 2;
+    sprite.layer.height += paddingY * 2;
+    results.push({ fileName: getSpriteFileName(sprite.layer.name) + ".png", bytes });
+  } finally {
+    frame.remove();
   }
 
   // Recursively export nested sprite children
   for (const child of sprite.nestedSprites) {
-    results.push(...await exportSpriteNode(child, scale));
+    results.push(...await exportSpriteNode(child, padding));
   }
 
   return results;
+}
+
+function padPng(bytes: Uint8Array, padding: number, tint: boolean): Promise<Uint8Array> {
+  const requestId = nextPngRequest++;
+  return new Promise((resolve, reject) => {
+    pendingPngs.set(requestId, { resolve, reject });
+    figma.ui.postMessage({ type: "pad-png", requestId, bytes, padding, tint });
+  });
 }
 
 /**
@@ -583,7 +629,7 @@ function hideNestedExportables(
     if (child.type === "TEXT" && child.visible) {
       hidden.push({ node: child, was: true });
       (child as SceneNode & { visible: boolean }).visible = false;
-    } else if (hasValidPrefix(child.name) && child.visible && !hasTintSuffix(child.name)) {
+    } else if (hasValidPrefix(child.name) && child.visible) {
       hidden.push({ node: child, was: true });
       (child as SceneNode & { visible: boolean }).visible = false;
     } else if ("children" in child && !hasValidPrefix(child.name) && !child.name.startsWith("#")) {
@@ -594,7 +640,10 @@ function hideNestedExportables(
 }
 
 function getSpriteFileName(layerName: string): string {
-  return stripAllSuffixes(layerName);
+  const path = stripAllSuffixes(layerName);
+  if (/[\\:*?"<>|]/.test(path) || path.split("/").some(part => !part || part === "." || part === ".."))
+    throw new Error(`不能用作相对 PNG 路径: ${layerName}`);
+  return path;
 }
 
 // ---------------------------------------------------------------------------
@@ -652,56 +701,6 @@ function getFirstVisibleSolidColor(paints: ReadonlyArray<Paint>): string | null 
 }
 
 /**
- * Whiten SOLID fills of a single node.
- */
-function whitenSolidFills(
-  node: SceneNode,
-  records: { node: SceneNode; originalFills: Paint[] }[],
-): void {
-  if (!("fills" in node)) return;
-  const fills = (node as GeometryMixin).fills;
-  if (!Array.isArray(fills)) return;
-  const hasSolid = fills.some((p: Paint) => p.type === "SOLID" && p.visible !== false);
-  if (!hasSolid) return;
-  records.push({ node, originalFills: [...fills] });
-  (node as GeometryMixin).fills = fills.map((p: Paint) => {
-    if (p.type === "SOLID" && p.visible !== false) {
-      return { ...p, color: { r: 1, g: 1, b: 1 } } as SolidPaint;
-    }
-    return p;
-  });
-}
-
-/**
- * Scan children for ~ suffixed nodes and whiten their SOLID fills.
- */
-function findAndWhitenTintChildren(
-  parent: SceneNode & ChildrenMixin,
-  records: { node: SceneNode; originalFills: Paint[] }[],
-): void {
-  for (const child of parent.children) {
-    if (!child.visible) continue;
-    if (hasTintSuffix(child.name) && "fills" in child) {
-      const fills = (child as GeometryMixin).fills;
-      if (Array.isArray(fills)) {
-        const hasSolid = fills.some((p: Paint) => p.type === "SOLID" && p.visible !== false);
-        if (hasSolid) {
-          records.push({ node: child, originalFills: [...fills] });
-          (child as GeometryMixin).fills = fills.map((p: Paint) => {
-            if (p.type === "SOLID" && p.visible !== false) {
-              return { ...p, color: { r: 1, g: 1, b: 1 } } as SolidPaint;
-            }
-            return p;
-          });
-        }
-      }
-    } else if ("children" in child && !hasValidPrefix(child.name)) {
-      findAndWhitenTintChildren(child as SceneNode & ChildrenMixin, records);
-    }
-  }
-}
-
-/**
  * Scan children for the first ~ suffixed node and return its solid fill color.
  */
 function findTintChildColor(parent: SceneNode & ChildrenMixin): string | null {
@@ -718,109 +717,12 @@ function findTintChildColor(parent: SceneNode & ChildrenMixin): string | null {
   return null;
 }
 
-function getFirstVisibleImageFill(node: SceneNode): ImagePaint | null {
-  const fills = getPaints(node);
-  if (!fills) return null;
-  for (const paint of fills) {
-    if (paint.type === "IMAGE" && paint.visible !== false && paint.imageHash) {
-      return paint;
-    }
-  }
-  return null;
-}
-
-async function getNodeScale(node: SceneNode): Promise<ScaleResult> {
-  const instanceScale = await getInstanceScale(node);
-  if (instanceScale !== null) return instanceScale;
-  const imageFillScale = await getImageFillScale(node);
-  if (imageFillScale !== null) return imageFillScale;
-  return { x: 1.0, y: 1.0 };
-}
-
-async function getInstanceScale(node: SceneNode): Promise<ScaleResult | null> {
-  if (node.type !== "INSTANCE") return null;
-  const mainComponent = await node.getMainComponentAsync();
-  if (!mainComponent || mainComponent.width === 0 || mainComponent.height === 0) {
-    return { x: 1.0, y: 1.0, warning: "部分实例节点无法读取主组件尺寸，scaleX/scaleY 已回退为 1.0" };
-  }
-  return {
-    x: roundScale(node.width / mainComponent.width),
-    y: roundScale(node.height / mainComponent.height),
-  };
-}
-
-async function getImageFillScale(node: SceneNode): Promise<ScaleResult | null> {
-  const imageFill = getFirstVisibleImageFill(node);
-  if (!imageFill || imageFill.imageHash === null) return null;
-  const image = figma.getImageByHash(imageFill.imageHash);
-  if (image === null) {
-    return { x: 1.0, y: 1.0, warning: "部分图片填充节点无法读取原图尺寸，scaleX/scaleY 已回退为 1.0" };
-  }
-  const imageSize = await image.getSizeAsync();
-  if (imageSize.width === 0 || imageSize.height === 0) {
-    return { x: 1.0, y: 1.0, warning: "部分图片填充节点无法读取原图尺寸，scaleX/scaleY 已回退为 1.0" };
-  }
-
-  const widthRatio = node.width / imageSize.width;
-  const heightRatio = node.height / imageSize.height;
-
-  if (imageFill.scaleMode === "FILL") {
-    const s = Math.max(widthRatio, heightRatio);
-    return { x: roundScale(s), y: roundScale(s) };
-  }
-  if (imageFill.scaleMode === "FIT") {
-    const s = Math.min(widthRatio, heightRatio);
-    return { x: roundScale(s), y: roundScale(s) };
-  }
-  if (imageFill.scaleMode === "TILE") {
-    const tileScale =
-      typeof imageFill.scalingFactor === "number" && imageFill.scalingFactor > 0
-        ? imageFill.scalingFactor : 1.0;
-    return { x: roundScale(tileScale), y: roundScale(tileScale) };
-  }
-  if (imageFill.scaleMode === "CROP") {
-    return getCropImageScale(node, imageSize, imageFill);
-  }
-  return { x: 1.0, y: 1.0 };
-}
-
-function getCropImageScale(
-  node: SceneNode,
-  imageSize: { width: number; height: number },
-  imageFill: ImagePaint,
-): ScaleResult {
-  const transform = imageFill.imageTransform;
-  if (!transform) {
-    return { x: 1.0, y: 1.0, warning: "部分 CROP 图片填充缺少 imageTransform，scaleX/scaleY 已回退为 1.0" };
-  }
-  const normalizedScaleX = Math.hypot(transform[0][0], transform[1][0]);
-  const normalizedScaleY = Math.hypot(transform[0][1], transform[1][1]);
-  if (normalizedScaleX <= 0 || normalizedScaleY <= 0) {
-    return { x: 1.0, y: 1.0, warning: "部分 CROP 图片填充缺少 imageTransform，scaleX/scaleY 已回退为 1.0" };
-  }
-  return {
-    x: roundScale((node.width * normalizedScaleX) / imageSize.width),
-    y: roundScale((node.height * normalizedScaleY) / imageSize.height),
-    warning: "CROP 图片填充的 scaleX/scaleY 按 imageTransform 近似计算",
-  };
-}
-
-function roundScale(value: number): number {
-  return Math.round(value * 10000) / 10000;
-}
-
-function normalizeDegrees(value: number): number {
-  let normalized = value % 360;
-  if (normalized > 180) normalized -= 360;
-  if (normalized <= -180) normalized += 360;
-  return Math.round(normalized * 10000) / 10000;
-}
-
 // ---------------------------------------------------------------------------
 // Part 9: Export main function
 // ---------------------------------------------------------------------------
 
-async function runExport(exportScale: number): Promise<void> {
+async function runExport(padding: number): Promise<void> {
+  if (padding !== 0 && padding !== 1 && padding !== 2) throw new Error("透明留边只能选择无、1px 或 2px");
   const frame = getSelectedFrame();
   if (!frame) {
     figma.ui.postMessage({ type: "error" });
@@ -828,18 +730,19 @@ async function runExport(exportScale: number): Promise<void> {
   }
 
   log(`画布: ${frame.name} (${Math.round(frame.width)}x${Math.round(frame.height)})`);
-  log(`导出倍率: ${exportScale}x`);
+  log(`透明留边: ${padding}px；图片默认原尺寸，节点 ^N 单独缩图`);
 
   const { layers, spriteTree } = await traverseFrame(frame);
   log(`共收集 ${layers.length} 个图层（${spriteTree.length} 个 sprite）`);
 
   // Export PNGs
   log("正在导出 PNG...");
-  const pngs = await exportAllSprites(spriteTree, exportScale);
+  const pngs = await exportAllSprites(spriteTree, padding);
   log(`共导出 ${pngs.length} 张 PNG`);
 
   // Build JSON
   const outputData: PSData = {
+    schemaVersion: 2,
     canvas: {
       width: Math.round(frame.width),
       height: Math.round(frame.height),
@@ -861,7 +764,7 @@ async function runExport(exportScale: number): Promise<void> {
 
   figma.ui.postMessage({
     type: "save-zip",
-    bytes: Array.from(zipBytes),
+    bytes: zipBytes,
     fileName: zipFileName,
   });
 

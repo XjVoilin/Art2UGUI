@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
+  <meta charset="utf-8">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -67,38 +68,74 @@
   <h2>Art2UGUI Export</h2>
   <div class="info">
     选中顶层 Frame，点击导出。输出 ZIP 包含 JSON + 所有切图 PNG。<br>
-    前缀：btn_ / img_ / icon_ / slider_ / sliderfill_ / bg_ / mask_ / tile_<br>
-    后缀：<code>$</code>=原始尺寸 <code>%</code>=九宫格 <code>#</code>=忽略 <code>@</code>=Prefab <code>~</code>=Tint(白图+颜色)<br>
-    无前缀节点不导出，TEXT 节点始终导出为文字数据。
+    前缀：<code>btn_</code> 按钮 / <code>img_</code> 图片<br>
+    后缀：<code>%</code> 九宫格 / <code>~</code> Tint（白图+原色）<br>
+    <code>^0.5</code>：PNG 宽高减半，布局大小不变。<br>
+    <code>#</code> 开头不生成独立导出项；隐藏节点跳过。<br>
+    可见文字只导出文字数据；无前缀组递归遍历。<br>
+    前缀组继续提取内部文字和带前缀的节点。<br>
+    示例：<code>btn_confirm%</code> / <code>img_star~</code> / <code>img_logo^0.5</code>
   </div>
   <div class="controls">
-    <label for="scaleSelect">导出倍率：</label>
-    <select id="scaleSelect">
-      <option value="1" selected>1x</option>
-      <option value="2">2x</option>
-      <option value="3">3x</option>
-      <option value="4">4x</option>
+    <label for="paddingSelect">透明留边：</label>
+    <select id="paddingSelect">
+      <option value="0">无</option>
+      <option value="1" selected>1px</option>
+      <option value="2">2px</option>
     </select>
   </div>
+  <div class="info">默认按原尺寸导出，用节点 <code>^0.5</code> 单独缩图。<br>
+    留边随节点倍率缩放，至少保留 1 个透明像素。</div>
   <button id="exportBtn">导出 ZIP (JSON + PNGs)</button>
   <div id="log"></div>
 
   <script>
     const exportBtn = document.getElementById('exportBtn');
     const logDiv = document.getElementById('log');
-    const scaleSelect = document.getElementById('scaleSelect');
+    const paddingSelect = document.getElementById('paddingSelect');
 
     exportBtn.addEventListener('click', () => {
       exportBtn.disabled = true;
       exportBtn.textContent = '导出中...';
       logDiv.innerHTML = '';
-      const scale = parseInt(scaleSelect.value, 10);
-      parent.postMessage({ pluginMessage: { type: 'export', scale: scale } }, '*');
+      const padding = parseInt(paddingSelect.value, 10);
+      parent.postMessage({ pluginMessage: { type: 'export', padding } }, '*');
     });
+
+    async function addPngBorder(bytes, padding, tint) {
+      const bitmap = await createImageBitmap(new Blob([new Uint8Array(bytes)], { type: 'image/png' }));
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = bitmap.width + padding * 2;
+        canvas.height = bitmap.height + padding * 2;
+        const context = canvas.getContext('2d');
+        if (!context) throw new Error('无法创建 PNG 留边画布');
+        context.drawImage(bitmap, padding, padding);
+        if (tint) {
+          context.globalCompositeOperation = 'source-in';
+          context.fillStyle = '#ffffff';
+          context.fillRect(0, 0, canvas.width, canvas.height);
+        }
+        const blob = await new Promise((resolve, reject) => {
+          canvas.toBlob(result => result ? resolve(result) : reject(new Error('PNG 留边编码失败')), 'image/png');
+        });
+        return new Uint8Array(await blob.arrayBuffer());
+      } finally {
+        bitmap.close();
+      }
+    }
 
     window.onmessage = (event) => {
       const msg = event.data.pluginMessage;
       if (!msg) return;
+
+      if (msg.type === 'pad-png') {
+        addPngBorder(msg.bytes, msg.padding, msg.tint).then(bytes => {
+          parent.postMessage({ pluginMessage: { type: 'png-padded', requestId: msg.requestId, bytes } }, '*');
+        }).catch(error => {
+          parent.postMessage({ pluginMessage: { type: 'png-padding-error', requestId: msg.requestId, error: String(error) } }, '*');
+        });
+      }
 
       if (msg.type === 'log') {
         const span = document.createElement('span');
@@ -124,16 +161,6 @@
         URL.revokeObjectURL(url);
       }
 
-      // Legacy JSON-only download support
-      if (msg.type === 'save-file') {
-        const blob = new Blob([msg.content], { type: 'application/json' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = msg.fileName;
-        a.click();
-        URL.revokeObjectURL(url);
-      }
     };
   </script>
 </body>

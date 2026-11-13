@@ -2,27 +2,10 @@
 (() => {
   var __create = Object.create;
   var __defProp = Object.defineProperty;
-  var __defProps = Object.defineProperties;
   var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
-  var __getOwnPropDescs = Object.getOwnPropertyDescriptors;
   var __getOwnPropNames = Object.getOwnPropertyNames;
-  var __getOwnPropSymbols = Object.getOwnPropertySymbols;
   var __getProtoOf = Object.getPrototypeOf;
   var __hasOwnProp = Object.prototype.hasOwnProperty;
-  var __propIsEnum = Object.prototype.propertyIsEnumerable;
-  var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
-  var __spreadValues = (a, b) => {
-    for (var prop in b || (b = {}))
-      if (__hasOwnProp.call(b, prop))
-        __defNormalProp(a, prop, b[prop]);
-    if (__getOwnPropSymbols)
-      for (var prop of __getOwnPropSymbols(b)) {
-        if (__propIsEnum.call(b, prop))
-          __defNormalProp(a, prop, b[prop]);
-      }
-    return a;
-  };
-  var __spreadProps = (a, b) => __defProps(a, __getOwnPropDescs(b));
   var __require = /* @__PURE__ */ ((x) => typeof require !== "undefined" ? require : typeof Proxy !== "undefined" ? new Proxy(x, {
     get: (a, b) => (typeof require !== "undefined" ? require : a)[b]
   }) : x)(function(x) {
@@ -2768,8 +2751,9 @@
 
   // src/code.ts
   var import_jszip = __toESM(require_jszip_min());
-  if (typeof setImmediate === "undefined") {
-    globalThis.setImmediate = (fn, ...args) => setTimeout(fn, 0, ...args);
+  var sandbox = globalThis;
+  if (typeof sandbox.setImmediate === "undefined") {
+    sandbox.setImmediate = (fn, ...args) => setTimeout(() => fn(...args), 0);
   }
   var VALID_PREFIXES = [
     "btn_",
@@ -2781,16 +2765,25 @@
     "mask_",
     "tile_"
   ];
-  figma.showUI(__html__, { width: 320, height: 480 });
+  figma.showUI(__html__, { width: 360, height: 600 });
+  var nextPngRequest = 0;
+  var pendingPngs = /* @__PURE__ */ new Map();
   figma.ui.onmessage = (msg) => {
-    var _a;
     if (msg.type === "export") {
-      const scale = (_a = msg.scale) != null ? _a : 1;
-      void runExport(scale).catch((error) => {
+      void runExport(msg.padding).catch((error) => {
         const message = error instanceof Error ? error.message : String(error);
         log(`\u5BFC\u51FA\u5931\u8D25\uFF1A${message}`, "error");
         figma.ui.postMessage({ type: "error" });
       });
+    } else if (msg.type === "png-padded" || msg.type === "png-padding-error") {
+      const pending = pendingPngs.get(msg.requestId);
+      if (!pending)
+        throw new Error(`\u672A\u77E5 PNG \u7559\u8FB9\u8BF7\u6C42: ${msg.requestId}`);
+      pendingPngs.delete(msg.requestId);
+      if (msg.type === "png-padded")
+        pending.resolve(new Uint8Array(msg.bytes));
+      else
+        pending.reject(new Error(msg.error));
     }
   };
   function log(text, level = "info") {
@@ -2804,15 +2797,26 @@
   }
   function hasTintSuffix(name) {
     const stripped = stripScaleSuffix(name);
-    return stripped.endsWith("~");
+    return /[$%@~]*~[$%@~]*$/.test(stripped);
   }
   function stripScaleSuffix(rawName) {
     if (rawName.length === 0)
       return "";
-    const lastStar = rawName.lastIndexOf("*");
-    if (lastStar === -1)
+    const lastCaret = rawName.lastIndexOf("^");
+    if (lastCaret === -1)
       return rawName;
-    return rawName.substring(0, lastStar);
+    return rawName.substring(0, lastCaret);
+  }
+  function getRasterScale(name) {
+    const lastCaret = name.lastIndexOf("^");
+    if (lastCaret < 0)
+      return 1;
+    const suffix = name.substring(lastCaret + 1);
+    const scale = Number(suffix);
+    if (!/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(suffix) || !Number.isFinite(scale) || scale <= 0) {
+      throw new Error(`\u8282\u70B9 PNG \u500D\u7387\u5FC5\u987B\u662F\u6B63\u6570\uFF0C\u4F8B\u5982 img_logo^0.5: ${name}`);
+    }
+    return scale;
   }
   function stripAllSuffixes(rawName) {
     let name = stripScaleSuffix(rawName);
@@ -2881,8 +2885,8 @@
           const spriteNode = {
             layer: layerData,
             figmaNode: child,
-            nestedSprites: [],
-            nestedTexts: []
+            rasterScale: getRasterScale(child.name),
+            nestedSprites: []
           };
           if ("children" in child) {
             const childFrame = child;
@@ -2931,7 +2935,6 @@
           const layerData = yield extractLayerData(child, groupPath, canvasX, canvasY, counter, warnings);
           if (layerData) {
             layers.push(layerData);
-            parentSprite.nestedTexts.push(child);
           }
           continue;
         }
@@ -2943,8 +2946,8 @@
           const nestedSprite = {
             layer: layerData,
             figmaNode: child,
-            nestedSprites: [],
-            nestedTexts: []
+            rasterScale: getRasterScale(child.name),
+            nestedSprites: []
           };
           if ("children" in child) {
             const childFrame = child;
@@ -2972,10 +2975,12 @@
   }
   function extractLayerData(node, groupPath, canvasX, canvasY, counter, warnings) {
     return __async(this, null, function* () {
-      var _a, _b;
+      var _a, _b, _c;
       const isText = node.type === "TEXT";
-      const geometry = getLayerGeometry(node, canvasX, canvasY);
-      const opacity = Math.round(("opacity" in node ? node.opacity : 1) * 100);
+      if (!isText)
+        getSpriteFileName(node.name);
+      const geometry = isText ? getLayerGeometry(node, canvasX, canvasY) : getRasterGeometry(node, canvasX, canvasY);
+      const opacity = getEffectiveOpacity(node);
       const data = {
         id: counter.id++,
         name: node.name,
@@ -2992,12 +2997,6 @@
         scaleY: 1,
         rotationZ: geometry.rotationZ
       };
-      const scale = yield getNodeScale(node);
-      data.scaleX = scale.x;
-      data.scaleY = scale.y;
-      if (scale.warning) {
-        warnings.add(scale.warning);
-      }
       if (isText && node.type === "TEXT") {
         const textNode = node;
         data.text = textNode.characters;
@@ -3008,6 +3007,9 @@
           const rangeFs = textNode.characters.length > 0 ? textNode.getRangeFontSize(0, 1) : 24;
           data.fontSize = typeof rangeFs === "number" ? rangeFs : 24;
         }
+        const textScale = getTransformScale(node.absoluteTransform);
+        data.fontSize = Math.round(data.fontSize * textScale.y * 1e4) / 1e4;
+        data.wordWrap = textNode.textAutoResize !== "WIDTH_AND_HEIGHT";
         data.fontColor = (_a = getTextFillColor(textNode)) != null ? _a : "#000000";
         const fontName = textNode.fontName;
         if (typeof fontName === "object" && "family" in fontName) {
@@ -3028,32 +3030,54 @@
         data.strokeColor = (_b = getTextStrokeColor(textNode)) != null ? _b : void 0;
         const sw = textNode.strokeWeight;
         if (typeof sw === "number" && sw > 0) {
-          data.strokeWidth = sw;
+          data.strokeWidth = sw * textScale.y;
         }
       }
-      if (!isText) {
-        if (hasTintSuffix(node.name) && "fills" in node) {
-          const color = getSolidFillColor(node);
-          if (color)
-            data.fontColor = color;
-        } else {
-          const tintColor = "children" in node ? findTintChildColor(node) : null;
-          if (tintColor) {
-            data.fontColor = tintColor;
-          } else if ("fills" in node) {
-            const color = getSolidFillColor(node);
-            if (color)
-              data.fontColor = color;
-          }
-        }
+      if (!isText && hasTintSuffix(node.name)) {
+        const color = (_c = getSolidFillColor(node)) != null ? _c : "children" in node ? findTintChildColor(node) : null;
+        if (color)
+          data.fontColor = color;
+        else
+          warnings.add(`Tint \u65E0\u53EF\u8BFB\u53D6\u7684\u7EAF\u8272\u8272\u6E90\uFF0C\u4FDD\u7559\u539F\u56FE: ${node.name}`);
       }
       return data;
     });
   }
+  function getEffectiveOpacity(node) {
+    let opacity = 1;
+    let current = node;
+    while (current) {
+      if ("opacity" in current)
+        opacity *= current.opacity;
+      current = current.parent;
+    }
+    return Math.round(opacity * 100);
+  }
+  function getRasterGeometry(node, canvasX, canvasY) {
+    const bounds = "absoluteRenderBounds" in node ? node.absoluteRenderBounds : null;
+    if (!bounds || bounds.width <= 0 || bounds.height <= 0)
+      throw new Error(`\u56FE\u7247\u6CA1\u6709\u53EF\u5BFC\u51FA\u7684\u6E32\u67D3\u8FB9\u754C: ${node.name}`);
+    return {
+      x: bounds.x - canvasX,
+      y: bounds.y - canvasY,
+      width: bounds.width,
+      height: bounds.height,
+      rotationZ: 0
+    };
+  }
+  function normalizeDegrees(degrees) {
+    let value = degrees % 360;
+    if (value > 180)
+      value -= 360;
+    if (value <= -180)
+      value += 360;
+    return Math.round(value * 1e4) / 1e4;
+  }
   function getLayerGeometry(node, canvasX, canvasY) {
     const transform = node.absoluteTransform;
-    const width = Math.round(node.width);
-    const height = Math.round(node.height);
+    const scale = getTransformScale(transform);
+    const width = Math.round(node.width * scale.x);
+    const height = Math.round(node.height * scale.y);
     const center = transformPoint(transform, node.width / 2, node.height / 2);
     const rotation = getNodeRotationDegrees(node);
     return {
@@ -3062,6 +3086,12 @@
       width,
       height,
       rotationZ: normalizeDegrees(-rotation)
+    };
+  }
+  function getTransformScale(transform) {
+    return {
+      x: Math.hypot(transform[0][0], transform[1][0]),
+      y: Math.hypot(transform[0][1], transform[1][1])
     };
   }
   function getNodeRotationDegrees(node) {
@@ -3104,55 +3134,74 @@
       y: transform[1][0] * x + transform[1][1] * y + transform[1][2]
     };
   }
-  function exportAllSprites(spriteTree, scale) {
+  function exportAllSprites(spriteTree, padding) {
     return __async(this, null, function* () {
       const results = [];
       for (const sprite of spriteTree) {
-        const pngs = yield exportSpriteNode(sprite, scale);
+        const pngs = yield exportSpriteNode(sprite, padding);
         results.push(...pngs);
       }
       return results;
     });
   }
-  function exportSpriteNode(sprite, scale) {
+  function exportSpriteNode(sprite, padding) {
     return __async(this, null, function* () {
       const results = [];
       const node = sprite.figmaNode;
-      const hidden = [];
-      if ("children" in node) {
-        hideNestedExportables(node, hidden);
-      }
-      const whitened = [];
-      if (hasTintSuffix(sprite.layer.name)) {
-        whitenSolidFills(node, whitened);
-      } else if ("children" in node) {
-        findAndWhitenTintChildren(node, whitened);
-      }
-      if ("exportAsync" in node) {
-        try {
-          const bytes = yield node.exportAsync({
-            format: "PNG",
-            contentsOnly: true,
-            constraint: { type: "SCALE", value: scale }
-          });
-          const fileName = getSpriteFileName(sprite.layer.name) + ".png";
-          results.push({ fileName, bytes });
-        } catch (e) {
-          log(`[\u8B66\u544A] \u5BFC\u51FA ${sprite.layer.name} \u5931\u8D25: ${e}`, "error");
-        }
-      }
-      for (const w of whitened) {
-        if ("fills" in w.node) {
-          w.node.fills = w.originalFills;
-        }
-      }
-      for (const h of hidden) {
-        h.node.visible = h.was;
+      if (!("clone" in node) || !("absoluteRenderBounds" in node))
+        throw new Error(`\u4E0D\u652F\u6301\u7684\u56FE\u7247\u8282\u70B9: ${node.name}`);
+      const bounds = node.absoluteRenderBounds;
+      const frame = figma.createFrame();
+      try {
+        frame.fills = [];
+        frame.clipsContent = true;
+        frame.resize(bounds.width, bounds.height);
+        frame.x = bounds.x;
+        frame.y = bounds.y;
+        const copy = node.clone();
+        frame.appendChild(copy);
+        const transform = node.absoluteTransform;
+        copy.relativeTransform = [
+          [transform[0][0], transform[0][1], transform[0][2] - bounds.x],
+          [transform[1][0], transform[1][1], transform[1][2] - bounds.y]
+        ];
+        if ("opacity" in copy)
+          copy.opacity = 1;
+        if ("children" in copy)
+          hideNestedExportables(copy, []);
+        let bytes = yield frame.exportAsync({
+          format: "PNG",
+          contentsOnly: true,
+          useAbsoluteBounds: true,
+          constraint: { type: "SCALE", value: sprite.rasterScale }
+        });
+        const pixels = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        const width = pixels.getUint32(16);
+        const height = pixels.getUint32(20);
+        const pixelPadding = padding > 0 ? Math.max(1, Math.round(padding * sprite.rasterScale)) : 0;
+        if (pixelPadding > 0 || sprite.layer.fontColor)
+          bytes = yield padPng(bytes, pixelPadding, !!sprite.layer.fontColor);
+        const paddingX = pixelPadding * sprite.layer.width / width;
+        const paddingY = pixelPadding * sprite.layer.height / height;
+        sprite.layer.x -= paddingX;
+        sprite.layer.y -= paddingY;
+        sprite.layer.width += paddingX * 2;
+        sprite.layer.height += paddingY * 2;
+        results.push({ fileName: getSpriteFileName(sprite.layer.name) + ".png", bytes });
+      } finally {
+        frame.remove();
       }
       for (const child of sprite.nestedSprites) {
-        results.push(...yield exportSpriteNode(child, scale));
+        results.push(...yield exportSpriteNode(child, padding));
       }
       return results;
+    });
+  }
+  function padPng(bytes, padding, tint) {
+    const requestId = nextPngRequest++;
+    return new Promise((resolve, reject) => {
+      pendingPngs.set(requestId, { resolve, reject });
+      figma.ui.postMessage({ type: "pad-png", requestId, bytes, padding, tint });
     });
   }
   function hideNestedExportables(parent, hidden) {
@@ -3160,7 +3209,7 @@
       if (child.type === "TEXT" && child.visible) {
         hidden.push({ node: child, was: true });
         child.visible = false;
-      } else if (hasValidPrefix(child.name) && child.visible && !hasTintSuffix(child.name)) {
+      } else if (hasValidPrefix(child.name) && child.visible) {
         hidden.push({ node: child, was: true });
         child.visible = false;
       } else if ("children" in child && !hasValidPrefix(child.name) && !child.name.startsWith("#")) {
@@ -3169,7 +3218,10 @@
     }
   }
   function getSpriteFileName(layerName) {
-    return stripAllSuffixes(layerName);
+    const path = stripAllSuffixes(layerName);
+    if (/[\\:*?"<>|]/.test(path) || path.split("/").some((part) => !part || part === "." || part === ".."))
+      throw new Error(`\u4E0D\u80FD\u7528\u4F5C\u76F8\u5BF9 PNG \u8DEF\u5F84: ${layerName}`);
+    return path;
   }
   function rgbToHex(color) {
     const r = Math.round(color.r * 255);
@@ -3219,46 +3271,6 @@
     }
     return null;
   }
-  function whitenSolidFills(node, records) {
-    if (!("fills" in node))
-      return;
-    const fills = node.fills;
-    if (!Array.isArray(fills))
-      return;
-    const hasSolid = fills.some((p) => p.type === "SOLID" && p.visible !== false);
-    if (!hasSolid)
-      return;
-    records.push({ node, originalFills: [...fills] });
-    node.fills = fills.map((p) => {
-      if (p.type === "SOLID" && p.visible !== false) {
-        return __spreadProps(__spreadValues({}, p), { color: { r: 1, g: 1, b: 1 } });
-      }
-      return p;
-    });
-  }
-  function findAndWhitenTintChildren(parent, records) {
-    for (const child of parent.children) {
-      if (!child.visible)
-        continue;
-      if (hasTintSuffix(child.name) && "fills" in child) {
-        const fills = child.fills;
-        if (Array.isArray(fills)) {
-          const hasSolid = fills.some((p) => p.type === "SOLID" && p.visible !== false);
-          if (hasSolid) {
-            records.push({ node: child, originalFills: [...fills] });
-            child.fills = fills.map((p) => {
-              if (p.type === "SOLID" && p.visible !== false) {
-                return __spreadProps(__spreadValues({}, p), { color: { r: 1, g: 1, b: 1 } });
-              }
-              return p;
-            });
-          }
-        }
-      } else if ("children" in child && !hasValidPrefix(child.name)) {
-        findAndWhitenTintChildren(child, records);
-      }
-    }
-  }
   function findTintChildColor(parent) {
     for (const child of parent.children) {
       if (!child.visible)
@@ -3274,117 +3286,24 @@
     }
     return null;
   }
-  function getFirstVisibleImageFill(node) {
-    const fills = getPaints(node);
-    if (!fills)
-      return null;
-    for (const paint of fills) {
-      if (paint.type === "IMAGE" && paint.visible !== false && paint.imageHash) {
-        return paint;
-      }
-    }
-    return null;
-  }
-  function getNodeScale(node) {
+  function runExport(padding) {
     return __async(this, null, function* () {
-      const instanceScale = yield getInstanceScale(node);
-      if (instanceScale !== null)
-        return instanceScale;
-      const imageFillScale = yield getImageFillScale(node);
-      if (imageFillScale !== null)
-        return imageFillScale;
-      return { x: 1, y: 1 };
-    });
-  }
-  function getInstanceScale(node) {
-    return __async(this, null, function* () {
-      if (node.type !== "INSTANCE")
-        return null;
-      const mainComponent = yield node.getMainComponentAsync();
-      if (!mainComponent || mainComponent.width === 0 || mainComponent.height === 0) {
-        return { x: 1, y: 1, warning: "\u90E8\u5206\u5B9E\u4F8B\u8282\u70B9\u65E0\u6CD5\u8BFB\u53D6\u4E3B\u7EC4\u4EF6\u5C3A\u5BF8\uFF0CscaleX/scaleY \u5DF2\u56DE\u9000\u4E3A 1.0" };
-      }
-      return {
-        x: roundScale(node.width / mainComponent.width),
-        y: roundScale(node.height / mainComponent.height)
-      };
-    });
-  }
-  function getImageFillScale(node) {
-    return __async(this, null, function* () {
-      const imageFill = getFirstVisibleImageFill(node);
-      if (!imageFill || imageFill.imageHash === null)
-        return null;
-      const image = figma.getImageByHash(imageFill.imageHash);
-      if (image === null) {
-        return { x: 1, y: 1, warning: "\u90E8\u5206\u56FE\u7247\u586B\u5145\u8282\u70B9\u65E0\u6CD5\u8BFB\u53D6\u539F\u56FE\u5C3A\u5BF8\uFF0CscaleX/scaleY \u5DF2\u56DE\u9000\u4E3A 1.0" };
-      }
-      const imageSize = yield image.getSizeAsync();
-      if (imageSize.width === 0 || imageSize.height === 0) {
-        return { x: 1, y: 1, warning: "\u90E8\u5206\u56FE\u7247\u586B\u5145\u8282\u70B9\u65E0\u6CD5\u8BFB\u53D6\u539F\u56FE\u5C3A\u5BF8\uFF0CscaleX/scaleY \u5DF2\u56DE\u9000\u4E3A 1.0" };
-      }
-      const widthRatio = node.width / imageSize.width;
-      const heightRatio = node.height / imageSize.height;
-      if (imageFill.scaleMode === "FILL") {
-        const s = Math.max(widthRatio, heightRatio);
-        return { x: roundScale(s), y: roundScale(s) };
-      }
-      if (imageFill.scaleMode === "FIT") {
-        const s = Math.min(widthRatio, heightRatio);
-        return { x: roundScale(s), y: roundScale(s) };
-      }
-      if (imageFill.scaleMode === "TILE") {
-        const tileScale = typeof imageFill.scalingFactor === "number" && imageFill.scalingFactor > 0 ? imageFill.scalingFactor : 1;
-        return { x: roundScale(tileScale), y: roundScale(tileScale) };
-      }
-      if (imageFill.scaleMode === "CROP") {
-        return getCropImageScale(node, imageSize, imageFill);
-      }
-      return { x: 1, y: 1 };
-    });
-  }
-  function getCropImageScale(node, imageSize, imageFill) {
-    const transform = imageFill.imageTransform;
-    if (!transform) {
-      return { x: 1, y: 1, warning: "\u90E8\u5206 CROP \u56FE\u7247\u586B\u5145\u7F3A\u5C11 imageTransform\uFF0CscaleX/scaleY \u5DF2\u56DE\u9000\u4E3A 1.0" };
-    }
-    const normalizedScaleX = Math.hypot(transform[0][0], transform[1][0]);
-    const normalizedScaleY = Math.hypot(transform[0][1], transform[1][1]);
-    if (normalizedScaleX <= 0 || normalizedScaleY <= 0) {
-      return { x: 1, y: 1, warning: "\u90E8\u5206 CROP \u56FE\u7247\u586B\u5145\u7F3A\u5C11 imageTransform\uFF0CscaleX/scaleY \u5DF2\u56DE\u9000\u4E3A 1.0" };
-    }
-    return {
-      x: roundScale(node.width * normalizedScaleX / imageSize.width),
-      y: roundScale(node.height * normalizedScaleY / imageSize.height),
-      warning: "CROP \u56FE\u7247\u586B\u5145\u7684 scaleX/scaleY \u6309 imageTransform \u8FD1\u4F3C\u8BA1\u7B97"
-    };
-  }
-  function roundScale(value) {
-    return Math.round(value * 1e4) / 1e4;
-  }
-  function normalizeDegrees(value) {
-    let normalized = value % 360;
-    if (normalized > 180)
-      normalized -= 360;
-    if (normalized <= -180)
-      normalized += 360;
-    return Math.round(normalized * 1e4) / 1e4;
-  }
-  function runExport(exportScale) {
-    return __async(this, null, function* () {
+      if (padding !== 0 && padding !== 1 && padding !== 2)
+        throw new Error("\u900F\u660E\u7559\u8FB9\u53EA\u80FD\u9009\u62E9\u65E0\u30011px \u6216 2px");
       const frame = getSelectedFrame();
       if (!frame) {
         figma.ui.postMessage({ type: "error" });
         return;
       }
       log(`\u753B\u5E03: ${frame.name} (${Math.round(frame.width)}x${Math.round(frame.height)})`);
-      log(`\u5BFC\u51FA\u500D\u7387: ${exportScale}x`);
+      log(`\u900F\u660E\u7559\u8FB9: ${padding}px\uFF1B\u56FE\u7247\u9ED8\u8BA4\u539F\u5C3A\u5BF8\uFF0C\u8282\u70B9 ^N \u5355\u72EC\u7F29\u56FE`);
       const { layers, spriteTree } = yield traverseFrame(frame);
       log(`\u5171\u6536\u96C6 ${layers.length} \u4E2A\u56FE\u5C42\uFF08${spriteTree.length} \u4E2A sprite\uFF09`);
       log("\u6B63\u5728\u5BFC\u51FA PNG...");
-      const pngs = yield exportAllSprites(spriteTree, exportScale);
+      const pngs = yield exportAllSprites(spriteTree, padding);
       log(`\u5171\u5BFC\u51FA ${pngs.length} \u5F20 PNG`);
       const outputData = {
+        schemaVersion: 2,
         canvas: {
           width: Math.round(frame.width),
           height: Math.round(frame.height)
@@ -3403,7 +3322,7 @@
       const zipFileName = frame.name + ".zip";
       figma.ui.postMessage({
         type: "save-zip",
-        bytes: Array.from(zipBytes),
+        bytes: zipBytes,
         fileName: zipFileName
       });
       log(`

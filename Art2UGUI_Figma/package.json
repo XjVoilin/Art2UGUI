@@ -3,6 +3,8 @@
   "version": "1.0.0",
   "description": "Export Figma layers to JSON for Unity PS2UGUI pipeline",
   "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --test tests/*.test.cjs",
     "build": "esbuild src/code.ts --bundle --outfile=dist/code.js --target=es6",
     "watch": "esbuild src/code.ts --bundle --outfile=dist/code.js --target=es6 --watch"
   },

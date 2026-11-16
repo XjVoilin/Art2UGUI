@@ -46,6 +46,49 @@ test('PNG is composited before cropping, resizing, and padding live layers', () 
   assert.equal(rendered.kind, 'NORMAL');
 });
 
+test('smart objects and raster layers discard transparent source canvas and update JSON to rendered pixels', () => {
+  for (const kind of ['SMARTOBJECT', 'NORMAL']) {
+    const result = run([image('Common/img_ad_01', {kind, rect:[-33,0,1080,1920], renderRect:[351,1502,459,1617]})], {padding:1});
+    const png = result.pngs.get('/design/Screen/Common/img_ad_01.png');
+    assert.deepEqual(png.size, [110,117]);
+    assert.deepEqual(png.crop, [351,1502,459,1617]);
+    const node = result.data.layers[0];
+    assert.deepEqual([node.x,node.y,node.width,node.height], [350,1501,110,117]);
+    assert.equal(node.scaleX, 1);
+  }
+});
+
+test('rendered smart-object bounds compose with raster scale without moving visible pixels', () => {
+  const result = run([image('img_ad^0.5', {kind:'SMARTOBJECT',rect:[-33,0,1080,1920],renderRect:[351,1502,459,1617]})], {padding:1});
+  assert.deepEqual(result.pngs.get('/design/Screen/img_ad.png').size, [56,60]);
+  const node=result.data.layers[0];
+  assert.equal(node.x + (node.width-108)/2, 351);
+  assert.equal(node.y + (node.height-115)/2, 1502);
+  assert.equal(node.scaleX, 1);
+});
+
+test('fixed canvas stays explicit while a padded smart object fits its actual artwork without shrinking a small icon', () => {
+  const result=run([image('img_ad[240x240]', {kind:'SMARTOBJECT',rect:[-33,0,1080,1920],renderRect:[351,1502,459,1617]})], {padding:1});
+  const png=result.pngs.get('/design/Screen/img_ad.png');
+  assert.deepEqual(png.size,[240,240]);
+  assert.deepEqual(png.contentSize,[108,115]);
+  const node=result.data.layers[0];
+  assert.deepEqual([node.x,node.y,node.width,node.height],[285,1439.5,240,240]);
+  assert.equal(node.fixedCanvas,true);
+});
+
+test('image bounds include rendered effects beyond the editable layer rectangle', () => {
+  const result=run([image('img_shadow',{rect:[20,30,100,90],renderRect:[15,25,110,105]})]);
+  assert.deepEqual(result.pngs.get('/design/Screen/img_shadow.png').size,[95,80]);
+  assert.deepEqual([result.data.layers[0].x,result.data.layers[0].y],[15,25]);
+});
+
+test('fully transparent rendered images fail clearly and close temporary documents', () => {
+  const result=run([image('img_empty',{kind:'SMARTOBJECT',rect:[0,0,1080,1920],renderRect:[0,0,0,0]})]);
+  assert.equal(result.pngs.size,0);
+  assert.match(result.alerts.at(-1),/没有可见像素/);
+});
+
 test('fixed canvas centers a smaller image without enlarging it and keeps the design center', () => {
   const result = run([image('img_coin[240x240]'), text('Caption[240x240]')], { padding: 1 });
   const png = result.pngs.get('/design/Screen/img_coin.png');

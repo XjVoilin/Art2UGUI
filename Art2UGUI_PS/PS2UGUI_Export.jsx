@@ -542,21 +542,28 @@
             copy.visible = true;
             copy.opacity = 100; // The effective opacity is applied once by Unity.
 
-            if (copy.typename === "LayerSet") {
+            var isGroup = copy.typename === "LayerSet";
+            if (isGroup) {
                 bounds = getRenderedGroupBounds(tempDoc);
-                item.data.x = bounds.x;
-                item.data.y = bounds.y;
-                item.data.width = bounds.width;
-                item.data.height = bounds.height;
                 if (bounds.width <= 0 || bounds.height <= 0) throw new Error("组内没有可见像素，无法生成 PNG");
+                hideNestedExportables(copy);
             }
-            if (copy.typename === "LayerSet") hideNestedExportables(copy);
             // Freeze the rendered pixels before crop/resizeCanvas. Live vector masks and
             // layer effects can re-render outside the measured rectangle after these operations.
             var rendered = tempDoc.duplicate("Art2UGUI_pixels", true);
             tempDoc.close(SaveOptions.DONOTSAVECHANGES);
             tempDoc = rendered;
             app.activeDocument = tempDoc;
+            if (!isGroup) {
+                // Smart objects can report their embedded canvas/mask rectangle instead
+                // of visible artwork. Measure the frozen pixels, including rendered effects.
+                bounds = getLayerBounds(tempDoc.layers[0]);
+                if (bounds.width <= 0 || bounds.height <= 0) throw new Error("图层没有可见像素，无法生成 PNG");
+            }
+            item.data.x = bounds.x;
+            item.data.y = bounds.y;
+            item.data.width = bounds.width;
+            item.data.height = bounds.height;
             if (item.data.fontColor) {
                 // Composite effects first, then whiten the complete alpha mask.
                 // This also whitens shadows/strokes instead of multiplying their colors again.
@@ -755,7 +762,7 @@
             if (exportLayerPNG(item, outputDir + "/" + item.fileName + ".png")) pngCount++;
         }
 
-        // 组的真实可见边界在切图阶段测得，JSON 必须在边界回写后序列化。
+        // 图片的真实可见边界在合成阶段测得，JSON 必须在边界回写后序列化。
         var jsonString = toJSON(outputData);
         var jsonFile = new File(outputDir + "/" + exportName + "_ui_data.json");
         jsonFile.encoding = "UTF-8";

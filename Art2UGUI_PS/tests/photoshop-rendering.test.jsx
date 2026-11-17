@@ -81,6 +81,7 @@
         app.activeDocument = source;
         var exporter = read(new File(project + "/PS2UGUI_Export.jsx"));
         exporter = exporter.replace("new Folder(outputDir).execute()", "true");
+        exporter = exporter.replace("    ensureNamingWatch();", "    // Registration is tested separately on the real entry file.");
         eval(exporter);
         var filename = target.name.replace(/\^[^^]*$/, "").replace(/[$%@~]+$/, "");
         var actual = new File(folder + "/RenderingCase/" + filename + ".png");

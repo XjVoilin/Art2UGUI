@@ -41,7 +41,7 @@
         var target = find(source.layerSets.getByName('UITimeoutReviveWindow'));
         assert(target && target.kind === LayerKind.SMARTOBJECT, 'Open the business PSD containing the padded ad smart object');
         assert(box(target).join(',') === '-33,0,1080,1920', 'Business fixture changed; inspect its bounds before adjusting expectations');
-        var exporter = read(new File(project + '/PS2UGUI_Export.jsx'), 'UTF-8').replace('new Folder(outputDir).execute()', 'true');
+        var exporter = read(new File(project + '/PS2UGUI_Export.jsx'), 'UTF-8').replace('new Folder(outputDir).execute()', 'true').replace("    ensureNamingWatch();", "    // Registration tested separately.");
         var cases = [
             { suffix: '', width: 110, height: 117, contentW: 108, contentH: 115, x: 350, y: 1501, logicalW: 110, logicalH: 117 },
             { suffix: '^0.5', width: 56, height: 60, contentW: 54, contentH: 58, x: 349, y: 1502 - 115 / 58, logicalW: 112, logicalH: 115 + 230 / 58 },

@@ -71,7 +71,7 @@
     }
     try {
         app.displayDialogs = DialogModes.NO; app.preferences.rulerUnits = Units.PIXELS;
-        var exporter = read(new File(project + "/PS2UGUI_Export.jsx")).replace("new Folder(outputDir).execute()", "true");
+        var exporter = read(new File(project + "/PS2UGUI_Export.jsx")).replace("new Folder(outputDir).execute()", "true").replace("    ensureNamingWatch();", "    // Registration tested separately.");
         doc = app.documents.add(1080,1920,72,"PanelCases",NewDocumentMode.RGB,DocumentFill.TRANSPARENT);
         var a = makeGroup("PanelA",false), b = makeGroup("PanelB",true);
         doc.saveAs(new File(output + "/PanelCases.psd"),new PhotoshopSaveOptions(),false);

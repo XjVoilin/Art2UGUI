@@ -35,7 +35,18 @@
 
 // @target photoshop
 
-(function () {
+(function (eventArguments) {
+    if (eventArguments.length > 0) {
+        var descriptor = eventArguments[0];
+        var toKey = charIDToTypeID('T   '), nameKey = charIDToTypeID('Nm  ');
+        if (!descriptor.hasKey(toKey) || descriptor.getType(toKey) !== DescValueType.OBJECTTYPE ||
+            !descriptor.getObjectValue(toKey).hasKey(nameKey)) return;
+        if (!hasNamingPrefix(descriptor.getObjectValue(toKey).getString(nameKey))) return;
+        if (app.documents.length > 0) checkRenamedLayer(app.activeDocument.activeLayer.id);
+        return;
+    }
+
+    ensureNamingWatch();
     if (app.documents.length === 0) {
         alert("PS2UGUI: 请先打开一个 PSD 文件。");
         return;
@@ -98,6 +109,7 @@
         dialog.margins = 16;
         dialog.spacing = 12;
         addHelpText(dialog, "导出 JSON + PNG，在 PSD 所在目录生成 PSD 或选中组的同名文件夹。", 36);
+        addHelpText(dialog, "改名重名提醒已启用：确认节点名称后自动检查。", 24);
         addNamingRules(dialog);
         var paddingRow = dialog.add("group");
         paddingRow.add("statictext", undefined, "透明留边：");
@@ -808,4 +820,123 @@
         app.activeDocument = doc;
         app.displayDialogs = originalDialogs;
     }
-})();
+    // The export script is also its own rename-event handler: one installed file.
+    function ensureNamingWatch() {
+        var handler = new File($.fileName);
+        var currentPath = handler.fsName.toLowerCase();
+        var legacyPath = new File(handler.parent + '/Art2UGUI_NamingWatch.jsx').fsName.toLowerCase();
+        var installed = false;
+        for (var i = app.notifiers.length - 1; i >= 0; i--) {
+            var eventPath = app.notifiers[i].eventFile.fsName.toLowerCase();
+            if (eventPath === legacyPath) app.notifiers[i].remove();
+            else if (eventPath === currentPath) installed = true;
+        }
+        if (!installed) app.notifiers.add('setd', handler, 'Lyr ');
+        app.notifiersEnabled = true;
+    }
+
+    function checkRenamedLayer(layerId) {
+        // One native snapshot avoids hundreds of slow cross-host DOM property reads.
+        // The JSON is serialized by Photoshop itself, not supplied as script text.
+        var reference = new ActionReference();
+        reference.putProperty(charIDToTypeID('Prpr'), stringIDToTypeID('json'));
+        reference.putEnumerated(charIDToTypeID('Dcmn'), charIDToTypeID('Ordn'), charIDToTypeID('Trgt'));
+        var snapshot = eval('(' + executeActionGet(reference).getString(stringIDToTypeID('json')) + ')');
+        var path = findNamingPath(snapshot.layers, layerId, []);
+        if (!path) return; // Another event handler may have removed the event target.
+        var layer = path[path.length - 1], root = path[0], topLevel = path.length === 1;
+        if (!isNamingResource(layer)) return;
+        for (var i = 0; i < path.length; i++) {
+            if (path[i].name.charAt(0) === '#' || (i > 0 && !path[i].visible)) return;
+        }
+        var matches = [], occupied = {}, key = layer.name.toLowerCase();
+        function inspect(nodes, parentNames) {
+            for (var i = 0; i < nodes.length; i++) {
+                var candidate = nodes[i];
+                if (candidate.name.charAt(0) === '#' || (!topLevel && !candidate.visible)) continue;
+                if (isNamingResource(candidate)) {
+                    occupied['$' + getSpriteFileName(candidate.name).toLowerCase()] = true;
+                    if (candidate.name.toLowerCase() === key) matches.push(parentNames.concat([candidate.name]).join(' > '));
+                }
+                if (!topLevel && candidate.layers) inspect(candidate.layers, parentNames.concat([candidate.name]));
+            }
+        }
+        inspect(topLevel ? snapshot.layers : root.layers, topLevel ? [] : [root.name]);
+        if (matches.length < 2) return;
+        showNamingReminder(layer.name, suggestNamingResource(layer.name, occupied), matches);
+    }
+
+    function showNamingReminder(name, recommendation, matches) {
+        var dialog = new Window('dialog', 'Art2UGUI');
+        dialog.orientation = 'column';
+        dialog.alignChildren = 'fill';
+        dialog.margins = 20;
+        dialog.spacing = 14;
+        var heading = dialog.add('statictext', undefined, '命名重复');
+        heading.graphics.font = ScriptUI.newFont(heading.graphics.font.name, 'BOLD', 16);
+        function field(label, value) {
+            var row = dialog.add('group'); row.orientation = 'row'; row.alignChildren = ['left', 'center'];
+            var caption = row.add('statictext', undefined, label); caption.preferredSize.width = 72;
+            var input = row.add('edittext', undefined, value, { readonly: true });
+            input.preferredSize = [320, 26]; input.helpTip = value;
+            return input;
+        }
+        field('当前名称：', name);
+        field('推荐名称：', recommendation);
+        dialog.add('statictext', undefined, '名称已保留，推荐名称可选中复制。');
+        var details = dialog.add('group'); details.orientation = 'column'; details.alignChildren = 'fill';
+        details.visible = false; details.maximumSize = [10000, 0];
+        var paths = details.add('edittext', undefined, matches.join('\n'), { multiline: true, readonly: true, scrolling: true });
+        paths.preferredSize = [400, 90];
+        var buttons = dialog.add('group'); buttons.orientation = 'row'; buttons.alignment = 'right';
+        var toggle = buttons.add('button', undefined, '查看冲突位置');
+        toggle.onClick = function () {
+            details.visible = !details.visible;
+            details.maximumSize = [10000, details.visible ? 110 : 0];
+            toggle.text = details.visible ? '收起位置' : '查看冲突位置';
+            dialog.layout.layout(true); dialog.size = dialog.preferredSize;
+        };
+        buttons.add('button', undefined, '知道了', { name: 'ok' });
+        dialog.show();
+    }
+
+    function findNamingPath(nodes, layerId, parents) {
+        for (var i = 0; i < nodes.length; i++) {
+            var path = parents.concat([nodes[i]]);
+            if (nodes[i].id === layerId) return path;
+            if (nodes[i].layers) {
+                var found = findNamingPath(nodes[i].layers, layerId, path);
+                if (found) return found;
+            }
+        }
+        return null;
+    }
+
+    function suggestNamingResource(name, occupied) {
+        var base = getSpriteFileName(name), suffix = name.substring(base.length);
+        var numbered = /^(.*?)(\d+)$/.exec(base);
+        var stem = numbered ? numbered[1] : base + (base.charAt(base.length - 1) === '_' ? '' : '_');
+        var digits = numbered ? numbered[2] : '00', candidate;
+        do {
+            // Work in decimal strings: preserve leading zeroes and avoid rounding
+            // a long user-entered number into a value that cannot increment.
+            var next = '', carry = 1;
+            for (var i = digits.length - 1; i >= 0; i--) {
+                var digit = Number(digits.charAt(i)) + carry;
+                next = String(digit % 10) + next;
+                carry = digit === 10 ? 1 : 0;
+            }
+            digits = (carry ? '1' : '') + next;
+            candidate = stem + digits;
+        } while (occupied['$' + candidate.toLowerCase()]);
+        return candidate + suffix;
+    }
+
+    function hasNamingPrefix(name) {
+        return /^(btn_|img_)/.test(name);
+    }
+
+    function isNamingResource(layer) {
+        return hasNamingPrefix(layer.name) && layer.type !== 'textLayer';
+    }
+})(typeof arguments === 'undefined' ? [] : arguments);

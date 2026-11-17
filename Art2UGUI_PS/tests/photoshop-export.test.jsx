@@ -99,6 +99,7 @@
         var exporter = readFile(new File(project + "/PS2UGUI_Export.jsx"), "UTF-8");
         // Suppress Explorer/Finder only; keep the production export path intact.
         exporter = exporter.replace("new Folder(outputDir).execute()", "true");
+        exporter = exporter.replace("    ensureNamingWatch();", "    // Registration is tested separately on the real entry file.");
         var cases = [
             { rasterScale: 1, padding: 0, origin: [21, 527] },
             { rasterScale: 2, padding: 0, origin: [21, 527] },

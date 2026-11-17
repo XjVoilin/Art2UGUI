@@ -212,6 +212,8 @@ function run(children, options = {}) {
   for (const index of options.selectedPath || []) doc.activeLayer = doc.activeLayer.layers[index];
   const initialSelection = doc.activeLayer;
   const app = { activeDocument: doc, documents: options.noDocument ? [] : [doc], displayDialogs: 'ALL' };
+  app.notifiers = [];
+  app.notifiers.add = (event, file, eventClass) => app.notifiers.push({event, eventFile:file, eventClass});
   function makeTemp(spec) {
     const temp = { layers: [], closed: false, crop(bounds) {
         assert.equal(this.layers[0].typename, 'ArtLayer', 'crop must operate on composited pixels');
@@ -267,6 +269,8 @@ function run(children, options = {}) {
   }
   class File {
     constructor(filePath) { this.path = filePath; this.error = 'write rejected'; }
+    get fsName() { return this.path; }
+    get parent() { return new Folder(path.posix.dirname(this.path)); }
     open() { return !options.failJsonOpen; }
     write(content) { if (options.failJsonWrite) return false; files.set(this.path, content); return true; }
     close() { this.closed = true; }
@@ -283,7 +287,7 @@ function run(children, options = {}) {
     }
     show() { return options.cancel ? 0 : options.exportSelected ? 2 : 1; }
   }
-  const context = vm.createContext({ app, alert: message => alerts.push(message), File, Folder, Window,
+  const context = vm.createContext({ app, $:{fileName:'/Scripts/PS2UGUI_Export.jsx'}, alert: message => alerts.push(message), File, Folder, Window,
     UnitValue: function(value) { this.value = value; },
     LayerKind: { TEXT: 'TEXT', SMARTOBJECT: 'SMARTOBJECT', SOLIDFILL: 'SOLIDFILL' },
     TextType: { POINTTEXT: 'POINTTEXT', PARAGRAPHTEXT: 'PARAGRAPHTEXT' },

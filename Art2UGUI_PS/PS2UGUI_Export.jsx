@@ -37,12 +37,7 @@
 
 (function (eventArguments) {
     if (eventArguments.length > 0) {
-        var descriptor = eventArguments[0];
-        var toKey = charIDToTypeID('T   '), nameKey = charIDToTypeID('Nm  ');
-        if (!descriptor.hasKey(toKey) || descriptor.getType(toKey) !== DescValueType.OBJECTTYPE ||
-            !descriptor.getObjectValue(toKey).hasKey(nameKey)) return;
-        if (!hasNamingPrefix(descriptor.getObjectValue(toKey).getString(nameKey))) return;
-        if (app.documents.length > 0) checkRenamedLayer(app.activeDocument.activeLayer.id);
+        if (isNamingEvent(eventArguments) && app.documents.length > 0) checkRenamedLayer(app.activeDocument.activeLayer.id);
         return;
     }
 
@@ -73,10 +68,61 @@
     var orderCounter = 0;
     var pngExportList = []; // {layer, data, fileName, bounds, rasterScale, fixedCanvas}
     var warnings = [];
+    var exportStage = "开始导出";
+    var exportLayerPath = "";
+    var exportFilePath = "";
+    var exportOutputDir = "";
+    var exportErrors = [];
 
     var VALID_PREFIXES = ["btn_", "img_", "icon_", "slider_", "sliderfill_", "bg_", "mask_", "tile_"];
 
     // ========== 工具函数 ==========
+
+    function setExportContext(stage, layerPath, filePath) {
+        exportStage = stage;
+        exportLayerPath = layerPath || "";
+        exportFilePath = filePath || "";
+    }
+
+    function recordExportError(error) {
+        var detail = "阶段: " + exportStage + "\n图层: " + exportLayerPath +
+            "\n目标文件: " + exportFilePath + "\n错误: " + error.message;
+        if (typeof error.number !== "undefined") detail += "\n错误编号: " + error.number;
+        if (typeof error.line !== "undefined") detail += "\n脚本行号: " + error.line;
+        if (error.fileName) detail += "\n错误脚本: " + error.fileName;
+        if (error.stack) detail += "\n调用栈: " + error.stack;
+        exportErrors.push(detail);
+        return detail;
+    }
+
+    function writeExportLog() {
+        // 日志失败不能覆盖原始导出错误；临时目录也能记录输出目录不可写的问题。
+        try {
+            var now = new Date();
+            var folder = ensureFolder(Folder.temp + "/Art2UGUI-Logs");
+            var file = new File(folder.fsName + "/PS2UGUI_" + now.getTime() + ".log");
+            var content = "PS2UGUI export diagnostics 2026-11-17.2\n时间: " + now.toString() +
+                "\nPhotoshop: " + app.version + "\n系统: " + $.os +
+                "\n脚本: " + new File($.fileName).fsName +
+                "\nPSD: " + docPath + "/" + doc.name +
+                "\n画布: " + canvasWidth + "x" + canvasHeight +
+                "\n分辨率: " + doc.resolution + "\n颜色模式: " + doc.mode +
+                "\n位深: " + doc.bitsPerChannel +
+                "\n范围: " + (exportOptions.group ? exportOptions.group.name : "整个 PSD") +
+                "\n透明留边: " + exportPadding + "px\n输出目录: " + exportOutputDir +
+                "\n\n" + exportErrors.join("\n\n") + "\n\n警告:\n" + warnings.join("\n");
+            file.encoding = "UTF-8";
+            if (!file.open("w")) throw new Error(file.error);
+            try {
+                if (!file.write(content)) throw new Error(file.error);
+            } finally {
+                file.close();
+            }
+            return "日志: " + file.fsName;
+        } catch (logError) {
+            return "日志写入失败: " + logError.message;
+        }
+    }
 
     function selectedGroupProblem(group) {
         if (!group || group.typename !== "LayerSet" || group.parent.typename !== "Document") {
@@ -295,6 +341,8 @@
     function getStrokeColor(layer) {
         try {
             var desc = getLayerDescriptor(layer);
+            if (desc.hasKey(stringIDToTypeID("layerFXVisible")) &&
+                !desc.getBoolean(stringIDToTypeID("layerFXVisible"))) return null;
             if (!desc.hasKey(stringIDToTypeID("layerEffects"))) return null;
             var effects = desc.getObjectValue(stringIDToTypeID("layerEffects"));
             if (!effects.hasKey(stringIDToTypeID("frameFX"))) return null;
@@ -348,6 +396,8 @@
         for (var i = 0; i < parent.layers.length; i++) {
             var child = parent.layers[i];
             var name = child.name;
+            setExportContext("读取图层数据", (exportOptions.group ? exportOptions.group.name + "/" : "") +
+                (groupPath === "" ? name : groupPath + "/" + name));
             if (!child.visible || name.charAt(0) === "#") continue;
             var isGroup = child.typename === "LayerSet";
 
@@ -440,14 +490,20 @@
         data.rotationZ = 0;
 
         var textItem = layer.textItem;
+        exportStage = "读取文字内容";
         data.text = textItem.contents;
+        exportStage = "读取文字字号与变换";
         data.fontSize = getTextFontSize(layer);
         data.wordWrap = textItem.kind === TextType.PARAGRAPHTEXT;
+        exportStage = "读取文字颜色";
         data.fontColor = colorToHex(textItem.color);
+        exportStage = "读取文字字体";
         data.fontName = textItem.font;
-        data.textAlignment = getTextAlignment(textItem.justification);
+        exportStage = "读取文字对齐";
+        data.textAlignment = getTextAlignment(layer);
 
         // Stroke
+        exportStage = "读取文字效果";
         var strokeColor = getStrokeColor(layer);
         if (strokeColor !== null) {
             data.strokeColor = strokeColor;
@@ -477,7 +533,14 @@
         return Math.round(size * 10000) / 10000;
     }
 
-    function getTextAlignment(justification) {
+    function getTextAlignment(layer) {
+        var justification;
+        try {
+            justification = layer.textItem.justification;
+        } catch (e) {
+            warnings.push("文字对齐读取失败，默认居中: " + exportLayerPath + " (" + e.number + ")");
+            return "center";
+        }
         if (justification === Justification.CENTER || justification === Justification.CENTERJUSTIFIED) return "center";
         if (justification === Justification.RIGHT || justification === Justification.RIGHTJUSTIFIED) return "right";
         return "left";
@@ -541,6 +604,8 @@
 
     function exportLayerPNG(item, outputPath) {
         var tempDoc = null;
+        setExportContext("创建 PNG 临时文档", (exportOptions.group ? exportOptions.group.name + "/" : "") +
+            (item.data.groupPath ? item.data.groupPath + "/" : "") + item.data.name, outputPath);
         try {
             var bounds = item.bounds;
             if (bounds.width <= 0 || bounds.height <= 0) throw new Error("图层边界为空，无法生成 PNG");
@@ -548,6 +613,7 @@
                 NewDocumentMode.RGB, DocumentFill.TRANSPARENT);
             var emptyLayer = tempDoc.activeLayer;
             app.activeDocument = doc;
+            exportStage = "复制图层到临时文档";
             var copy = item.layer.duplicate(tempDoc, ElementPlacement.PLACEATBEGINNING);
             app.activeDocument = tempDoc;
             emptyLayer.remove();
@@ -556,17 +622,20 @@
 
             var isGroup = copy.typename === "LayerSet";
             if (isGroup) {
+                exportStage = "测量图层组可见边界";
                 bounds = getRenderedGroupBounds(tempDoc);
                 if (bounds.width <= 0 || bounds.height <= 0) throw new Error("组内没有可见像素，无法生成 PNG");
                 hideNestedExportables(copy);
             }
             // Freeze the rendered pixels before crop/resizeCanvas. Live vector masks and
             // layer effects can re-render outside the measured rectangle after these operations.
+            exportStage = "合成透明像素";
             var rendered = tempDoc.duplicate("Art2UGUI_pixels", true);
             tempDoc.close(SaveOptions.DONOTSAVECHANGES);
             tempDoc = rendered;
             app.activeDocument = tempDoc;
             if (!isGroup) {
+                exportStage = "测量图片可见边界";
                 // Smart objects can report their embedded canvas/mask rectangle instead
                 // of visible artwork. Measure the frozen pixels, including rendered effects.
                 bounds = getLayerBounds(tempDoc.layers[0]);
@@ -577,6 +646,7 @@
             item.data.width = bounds.width;
             item.data.height = bounds.height;
             if (item.data.fontColor) {
+                exportStage = "应用 Tint 置白";
                 // Composite effects first, then whiten the complete alpha mask.
                 // This also whitens shadows/strokes instead of multiplying their colors again.
                 applyWhiteColorOverlay(tempDoc.layers[0]);
@@ -584,6 +654,7 @@
 
             // 保留分离前的矩形，避免隐藏文字/子图片后 trim 改变切图原点。
             // 不 flatten：PNG 必须保留透明度。
+            exportStage = "裁切图片";
             tempDoc.crop([new UnitValue(bounds.x, "px"), new UnitValue(bounds.y, "px"),
                 new UnitValue(bounds.x + bounds.width, "px"), new UnitValue(bounds.y + bounds.height, "px")]);
             var pixelScale = item.rasterScale;
@@ -594,10 +665,12 @@
             var pixelWidth = Math.max(1, Math.round(bounds.width * pixelScale * fit));
             var pixelHeight = Math.max(1, Math.round(bounds.height * pixelScale * fit));
             if (pixelWidth !== bounds.width || pixelHeight !== bounds.height) {
+                exportStage = "缩放图片";
                 tempDoc.resizeImage(new UnitValue(pixelWidth, "px"),
                     new UnitValue(pixelHeight, "px"), undefined, ResampleMethod.BICUBIC);
             }
             if (fixedPixels !== null) {
+                exportStage = "设置固定画布";
                 tempDoc.resizeCanvas(new UnitValue(fixedPixels.width, "px"),
                     new UnitValue(fixedPixels.height, "px"), AnchorPosition.MIDDLECENTER);
                 item.data.x = bounds.x + bounds.width / 2 - item.fixedCanvas.width / 2;
@@ -605,6 +678,7 @@
                 item.data.width = item.fixedCanvas.width;
                 item.data.height = item.fixedCanvas.height;
             } else if (exportPadding > 0) {
+                exportStage = "添加透明留边";
                 // 缩放后再扩画布，避免插值将图案颜色扩散进新增的透明边。
                 // 先裁切后居中扩展，也能正确处理贴着原画布边缘的图案。
                 var pixelPadding = Math.max(1, Math.round(exportPadding * pixelScale));
@@ -622,12 +696,15 @@
             var pngOpts = new PNGSaveOptions();
             pngOpts.compression = 6;
             pngOpts.interlaced = false;
+            exportStage = "保存 PNG";
             tempDoc.saveAs(new File(outputPath), pngOpts, true, Extension.LOWERCASE);
             return true;
         } catch (e) {
+            recordExportError(e);
             warnings.push("PNG 导出失败: " + item.layer.name + " - " + e.message);
             return false;
         } finally {
+            exportStage = "清理 PNG 临时文档";
             try {
                 if (tempDoc !== null) tempDoc.close(SaveOptions.DONOTSAVECHANGES);
             } finally {
@@ -736,6 +813,9 @@
         var seen = {};
         for (var i = 0; i < pngExportList.length; i++) {
             var fileName = pngExportList[i].fileName;
+            setExportContext("校验 PNG 路径", (exportOptions.group ? exportOptions.group.name + "/" : "") +
+                (pngExportList[i].data.groupPath ? pngExportList[i].data.groupPath + "/" : "") + pngExportList[i].data.name,
+                exportOutputDir + "/" + fileName + ".png");
             var segments = fileName.split("/");
             for (var j = 0; j < segments.length; j++) {
                 var segment = segments[j];
@@ -753,31 +833,40 @@
     function runExport() {
         var startTime = new Date().getTime();
         var panel = exportOptions.group;
-        // The selected group is a panel container. Its hidden state is intentionally
-        // ignored without mutating it; hidden descendants retain the normal rules.
-        traverseLayers(panel || doc, "");
-        if (panel && layers.length === 0) throw new Error("选中组没有符合命名规则的可导出图层。");
-        if (panel && pngExportList.length === 0) warnings.push("本次仅导出文字，未发现带 img_/btn_ 等前缀的图片；如需切图，请先整理图片命名。");
-        validateSpritePaths();
         var docName = doc.name.replace(/\.[^.]+$/, "");
         var exportName = panel ? panel.name : docName;
         var outputDir = docPath + "/" + exportName;
+        exportOutputDir = outputDir;
+        // The selected group is a panel container. Its hidden state is intentionally
+        // ignored without mutating it; hidden descendants retain the normal rules.
+        setExportContext("遍历图层");
+        traverseLayers(panel || doc, "");
+        setExportContext("校验导出路径");
+        if (panel && layers.length === 0) throw new Error("选中组没有符合命名规则的可导出图层。");
+        if (panel && pngExportList.length === 0) warnings.push("本次仅导出文字，未发现带 img_/btn_ 等前缀的图片；如需切图，请先整理图片命名。");
+        validateSpritePaths();
         var outputData = { schemaVersion: 2,
             canvas: { width: canvasWidth, height: canvasHeight }, layers: layers };
+        setExportContext("创建输出目录", "", outputDir);
         ensureFolder(outputDir);
 
         var pngCount = 0;
         for (var i = 0; i < pngExportList.length; i++) {
             var item = pngExportList[i];
+            setExportContext("创建 PNG 输出目录", (panel ? panel.name + "/" : "") +
+                (item.data.groupPath ? item.data.groupPath + "/" : "") + item.data.name,
+                outputDir + "/" + item.fileName + ".png");
             var slashIdx = item.fileName.lastIndexOf("/");
             if (slashIdx >= 0) ensureFolder(outputDir + "/" + item.fileName.substring(0, slashIdx));
             if (exportLayerPNG(item, outputDir + "/" + item.fileName + ".png")) pngCount++;
         }
 
         // 图片的真实可见边界在合成阶段测得，JSON 必须在边界回写后序列化。
+        setExportContext("生成 JSON", "", outputDir + "/" + exportName + "_ui_data.json");
         var jsonString = toJSON(outputData);
         var jsonFile = new File(outputDir + "/" + exportName + "_ui_data.json");
         jsonFile.encoding = "UTF-8";
+        exportStage = "写入 JSON";
         if (!jsonFile.open("w")) throw new Error("无法写入 JSON: " + jsonFile.error);
         try {
             if (!jsonFile.write(jsonString)) throw new Error("JSON 写入失败: " + jsonFile.error);
@@ -807,6 +896,7 @@
             msg += "\n\n警告 (" + warnings.length + "):\n";
             for (var w = 0; w < warnings.length; w++) msg += "- " + warnings[w] + "\n";
         }
+        if (failed > 0) msg += "\n\n" + writeExportLog();
         alert(msg);
     }
 
@@ -815,7 +905,9 @@
         app.displayDialogs = DialogModes.NO;
         runExport();
     } catch (e) {
-        alert("PS2UGUI: 导出失败\n" + e.message);
+        recordExportError(e);
+        alert("PS2UGUI: 导出失败\n" + e.message + "\n阶段: " + exportStage +
+            (exportLayerPath ? "\n图层: " + exportLayerPath : "") + "\n\n" + writeExportLog());
     } finally {
         app.activeDocument = doc;
         app.displayDialogs = originalDialogs;
@@ -825,14 +917,50 @@
         var handler = new File($.fileName);
         var currentPath = handler.fsName.toLowerCase();
         var legacyPath = new File(handler.parent + '/Art2UGUI_NamingWatch.jsx').fsName.toLowerCase();
-        var installed = false;
+        // Single-file distribution; generate a tiny internal event entry automatically.
+        var folder = ensureFolder(Folder.userData + '/Art2UGUI/Photoshop' + app.version.split('.')[0]);
+        var entry = new File(folder.fsName + '/RenameEvent.jsx');
+        var content = buildNamingEntry(handler.fsName);
+        var existing = '';
+        if (entry.exists) {
+            entry.encoding = 'UTF-8';
+            if (!entry.open('r')) throw new Error('无法读取命名提醒入口：' + entry.error);
+            try { existing = entry.read().replace(/^\uFEFF/, ''); } finally { entry.close(); }
+        }
+        if (existing !== content) {
+            entry.encoding = 'UTF-8';
+            if (!entry.open('w')) throw new Error('无法配置命名提醒入口：' + entry.error);
+            try { if (!entry.write('\uFEFF' + content)) throw new Error('无法写入命名提醒入口：' + entry.error); }
+            finally { entry.close(); }
+        }
+        var entryPath = entry.fsName.toLowerCase(), installed = false;
         for (var i = app.notifiers.length - 1; i >= 0; i--) {
             var eventPath = app.notifiers[i].eventFile.fsName.toLowerCase();
-            if (eventPath === legacyPath) app.notifiers[i].remove();
-            else if (eventPath === currentPath) installed = true;
+            if (eventPath === legacyPath || eventPath === currentPath) app.notifiers[i].remove();
+            else if (eventPath === entryPath) installed = true;
         }
-        if (!installed) app.notifiers.add('setd', handler, 'Lyr ');
+        if (!installed) app.notifiers.add('setd', entry, 'Lyr ');
         app.notifiersEnabled = true;
+    }
+
+    function isNamingEvent(eventArguments) {
+        if (eventArguments.length < 2 || eventArguments[1] !== charIDToTypeID('setd')) return false;
+        var descriptor = eventArguments[0], toKey = charIDToTypeID('T   '), nameKey = charIDToTypeID('Nm  ');
+        return descriptor.hasKey(toKey) && descriptor.getType(toKey) === DescValueType.OBJECTTYPE &&
+            descriptor.getObjectValue(toKey).hasKey(nameKey) &&
+            hasNamingPrefix(descriptor.getObjectValue(toKey).getString(nameKey));
+    }
+
+    function buildNamingEntry(mainPath) {
+        return '(function (eventArguments) {\n' +
+            'var hasNamingPrefix = ' + hasNamingPrefix.toString() + ';\n' +
+            'var isNamingEvent = ' + isNamingEvent.toString() + ';\n' +
+            'if (!isNamingEvent(eventArguments) || !app.documents.length) return;\n' +
+            'var file = new File(' + escapeString(mainPath) + '); file.encoding = "UTF-8";\n' +
+            'if (!file.open("r")) throw new Error("Cannot read Art2UGUI export script: " + file.fsName);\n' +
+            'var code; try { code = file.read(); } finally { file.close(); }\n' +
+            'eval("(function () {\\n" + code + "\\n}).apply(null, eventArguments);");\n' +
+            '})(typeof arguments === "undefined" ? [] : arguments);';
     }
 
     function checkRenamedLayer(layerId) {

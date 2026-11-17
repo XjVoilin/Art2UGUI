@@ -4,11 +4,12 @@ const fs=require('node:fs');
 const path=require('node:path');
 const vm=require('node:vm');
 const source=fs.readFileSync(path.join(__dirname,'../PS2UGUI_Export.jsx'),'utf8');
+const entryPath='/UserData/Art2UGUI/Photoshop24/RenameEvent.jsx';
 let nextId=1;
 const leaf=(name,extra={})=>({id:nextId++,name,typename:'ArtLayer',visible:true,...extra});
 const group=(name,layers,extra={})=>({id:nextId++,name,typename:'LayerSet',visible:true,layers,...extra});
 function run(layers,active,options={}){
- const doc={typename:'Document',layers,activeLayer:active},alerts=[],registrations=[];let snapshots=0;
+ const doc={typename:'Document',layers,activeLayer:active},alerts=[],registrations=[];let snapshots=0,mainReads=0;const scriptFiles=new Map(options.scriptFiles||[]),folders=new Set(['/','/UserData','/Scripts']);
  const jsonLayer=l=>({id:l.id,name:l.name,visible:l.visible,type:l.typename==='LayerSet'?'layerSection':l.kind==='TEXT'?'textLayer':'layer',
   ...(l.layers?{layers:l.layers.map(jsonLayer)}:{})});
  const snapshotJson=JSON.stringify({layers:layers.map(jsonLayer)});
@@ -19,7 +20,7 @@ function run(layers,active,options={}){
  const own='/Scripts/PS2UGUI_Export.jsx';
  const notifiers=(options.paths||[]).map(p=>({eventFile:{fsName:p},remove(){notifiers.splice(notifiers.indexOf(this),1);}}));
  notifiers.add=(event,file,eventClass)=>{registrations.push([event,file.fsName,eventClass]);notifiers.push({eventFile:file,remove(){notifiers.splice(notifiers.indexOf(this),1);}});};
- const app={documents:options.noDoc||options.manual?[]:[doc],activeDocument:doc,notifiers,notifiersEnabled:options.enabled||false};
+ const app={documents:options.noDoc||options.manual?[]:[doc],activeDocument:doc,notifiers,notifiersEnabled:options.enabled||false,version:'24.3.0'};
  class Descriptor{
   constructor(data){this.data=data;}
   hasKey(key){return Object.hasOwn(this.data,key);}
@@ -27,19 +28,22 @@ function run(layers,active,options={}){
   getObjectValue(key){return new Descriptor(this.data[key]);}
   getString(key){return this.data[key];}
  }
- const args=options.manual?[]:[new Descriptor(options.event||{'T   ':{'Nm  ':active.name}})];
+ const args=options.manual?[]:[new Descriptor(options.event||{'T   ':{'Nm  ':active.name}}),options.eventId||'setd'];
  class Control{
   constructor(type,text=''){this.type=type;this.text=text;this.children=[];this.graphics={font:{name:'Tahoma'}};this.preferredSize={};this.layout={layout(){}};}
   add(type,bounds,text){const c=new Control(type,text);this.children.push(c);return c;}
   show(){const render=c=>c.children.length?c.children.map(render).join(c.orientation==='row'?'':'\n'):c.text;
    alerts.push(render(this));return 1;}
  }
- vm.runInNewContext(source,{app,arguments:args,$:{fileName:own},File:function(p){this.fsName=p;this.parent='/Scripts';},charIDToTypeID:x=>x,
+ class Folder{constructor(p){this.fsName=String(p);}get exists(){return folders.has(this.fsName);}get parent(){return new Folder(path.posix.dirname(this.fsName));}create(){folders.add(this.fsName);return true;}toString(){return this.fsName;}}
+ Folder.userData='/UserData';
+ class File{constructor(p){this.fsName=p;this.error='IO failure';}get parent(){return new Folder(path.posix.dirname(this.fsName));}get exists(){return scriptFiles.has(this.fsName);}open(){return true;}close(){}write(s){scriptFiles.set(this.fsName,s);return true;}read(){if(this.fsName===own){mainReads++;return source;}return scriptFiles.get(this.fsName);}}
+ vm.runInNewContext(options.entrySource||source,{app,arguments:args,$:{fileName:own},File,Folder,charIDToTypeID:x=>x,
   DescValueType:{OBJECTTYPE:'object'},LayerKind:{TEXT:'TEXT'},alert:m=>alerts.push(m),
   stringIDToTypeID:x=>x,ActionReference:class{putProperty(){}putEnumerated(){}},
   executeActionGet:()=>{snapshots++;return new Descriptor({json:snapshotJson});},
   Window:function(type,title){return new Control(type,title);},ScriptUI:{newFont:()=>({name:'Tahoma'})}});
- return {alerts,app,registrations,snapshots};
+ return {alerts,app,registrations,snapshots,scriptFiles,mainReads};
 }
 test('rename check reads one native snapshot and never traverses Photoshop DOM layers',()=>{
  const active=leaf('img_prop_01');const r=run([group('Panel',[group('Deep',[leaf(active.name),active])])],active,{forbidDOMTraversal:true});
@@ -136,19 +140,38 @@ test('late events after document closing do not trigger a reminder',()=>{
 });
 test('enable registers one native layer Set listener without disturbing other listeners',()=>{
  const r=run([],null,{manual:true,paths:['/Other.jsx']});
- assert.deepEqual(r.registrations,[['setd','/Scripts/PS2UGUI_Export.jsx','Lyr ']]);
+ assert.deepEqual(r.registrations,[['setd',entryPath,'Lyr ']]);
  assert.equal(r.app.notifiersEnabled,true);assert.equal(r.app.notifiers.length,2);
 });
 test('running export again keeps its listener and unrelated listeners without registering twice',()=>{
- const r=run([],null,{manual:true,paths:['/Other.jsx','/Scripts/PS2UGUI_Export.jsx'],enabled:true});
+ const r=run([],null,{manual:true,paths:['/Other.jsx',entryPath],enabled:true});
  assert.equal(r.app.notifiers.length,2);assert.equal(r.registrations.length,0);assert.equal(r.app.notifiersEnabled,true);
 });
 test('an installed but globally disabled listener is resumed without duplication',()=>{
- const r=run([],null,{manual:true,paths:['/Scripts/PS2UGUI_Export.jsx']});assert.equal(r.app.notifiersEnabled,true);
+ const r=run([],null,{manual:true,paths:[entryPath]});assert.equal(r.app.notifiersEnabled,true);
  assert.equal(r.registrations.length,0);assert.equal(r.app.notifiers.length,1);
 });
 test('first export migrates the old sibling watcher without touching unrelated listeners',()=>{
  const r=run([],null,{manual:true,paths:['/Other.jsx','/Scripts/Art2UGUI_NamingWatch.jsx']});
  assert.equal(r.app.notifiers.length,2);assert.equal(r.app.notifiers[0].eventFile.fsName,'/Other.jsx');
- assert.equal(r.app.notifiers[1].eventFile.fsName,'/Scripts/PS2UGUI_Export.jsx');
+ assert.equal(r.app.notifiers[1].eventFile.fsName,entryPath);
+});
+
+test('light entry ignores selection, unrelated sets and Common names without loading the main script',()=>{
+ const bootstrap=run([],null,{manual:true});const entrySource=bootstrap.scriptFiles.get(entryPath);
+ assert.ok(entrySource.length<3000);
+ for(const options of [{eventId:'slct'},{event:{'T   ':{opacity:50}}}]){
+  const active=leaf('img_01');const r=run([group('Panel',[active])],active,{...options,entrySource});
+  assert.equal(r.mainReads,0);assert.equal(r.snapshots,0);assert.equal(r.alerts.length,0);
+ }
+ const active=leaf('Common/img_01');assert.equal(run([group('Panel',[active])],active,{entrySource}).mainReads,0);
+});
+test('light entry forwards a real rename to the main script once and retains the confirmed name',()=>{
+ const entrySource=run([],null,{manual:true}).scriptFiles.get(entryPath),active=leaf('img_01');
+ const r=run([group('Panel',[leaf(active.name),active])],active,{entrySource});
+ assert.equal(r.mainReads,1);assert.equal(r.snapshots,1);assert.match(r.alerts[0],/推荐名称：img_02/);assert.equal(active.name,'img_01');
+});
+test('old registrations on the main export file are migrated to the lightweight entry',()=>{
+ const r=run([],null,{manual:true,paths:['/Other.jsx','/Scripts/PS2UGUI_Export.jsx']});
+ assert.equal(r.app.notifiers.length,2);assert.equal(r.app.notifiers[1].eventFile.fsName,entryPath);
 });

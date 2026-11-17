@@ -125,7 +125,7 @@ test('fixed canvas composes with tint, slicing and raster scale without changing
 test('invalid fixed sizes fail before writing export files', () => {
   for (const suffix of ['[0x240]', '[2.5x240]', '[240x]', '[240x240][120x120]', '[1x1]']) {
     const result = run([image('img_coin' + suffix)], { padding: 1 });
-    assert.equal(result.files.size, 0);
+    assert.equal(result.exportFiles.size, 0);
     assert.equal(result.temps.length, 0);
     assert.match(result.alerts.at(-1), /固定画布/);
   }
@@ -183,6 +183,12 @@ function run(children, options = {}) {
     const layer = { ...clone(spec), bounds: spec.rect.map(n => unit(n)) };
     Object.defineProperty(layer, 'parent', { value: parent || owner });
     if (spec.text) layer.textItem = { ...spec.text, size: unit(spec.text.size, 'pt') };
+    if (original && options.failTextFont && spec.text) Object.defineProperty(layer.textItem, 'font', {
+      get() { const error = new Error('General Photoshop error'); error.number = 8800; error.line = 456; throw error; }
+    });
+    if (original && options.failJustification && spec.text) Object.defineProperty(layer.textItem, 'justification', {
+      get() { const error = new Error('General Photoshop error'); error.number = -1715; throw error; }
+    });
     if (spec.children) {
       layer.layers = spec.children.map(child => materialize(child, owner, original, layer));
     }
@@ -211,7 +217,7 @@ function run(children, options = {}) {
   doc.activeLayer = doc.layers[0];
   for (const index of options.selectedPath || []) doc.activeLayer = doc.activeLayer.layers[index];
   const initialSelection = doc.activeLayer;
-  const app = { activeDocument: doc, documents: options.noDocument ? [] : [doc], displayDialogs: 'ALL' };
+  const app = { activeDocument: doc, documents: options.noDocument ? [] : [doc], displayDialogs: 'ALL', version:'24.3.0' };
   app.notifiers = [];
   app.notifiers.add = (event, file, eventClass) => app.notifiers.push({event, eventFile:file, eventClass});
   function makeTemp(spec) {
@@ -257,7 +263,7 @@ function run(children, options = {}) {
     constructor(folderPath) { this.fsName = String(folderPath); }
     get exists() { return folders.has(this.fsName); }
     get parent() { return new Folder(path.posix.dirname(this.fsName)); }
-    create() { folders.add(this.fsName); return true; }
+    create() { if (options.failLog && this.fsName.startsWith('/Temp/')) return false; folders.add(this.fsName); return true; }
     execute() {
       assert.ok(files.has(this.fsName + '/' + path.posix.basename(this.fsName) + '_ui_data.json'), 'open output only after JSON is written');
       if (options.throwOpenFolder) throw new Error('file browser unavailable');
@@ -271,10 +277,13 @@ function run(children, options = {}) {
     constructor(filePath) { this.path = filePath; this.error = 'write rejected'; }
     get fsName() { return this.path; }
     get parent() { return new Folder(path.posix.dirname(this.path)); }
-    open() { return !options.failJsonOpen; }
-    write(content) { if (options.failJsonWrite) return false; files.set(this.path, content); return true; }
+    open() { return this.path.startsWith('/UserData/') || !this.path.endsWith('.json') || !options.failJsonOpen; }
+    write(content) { if(this.path.startsWith('/UserData/'))return true; if (options.failJsonWrite && this.path.endsWith('.json')) return false; files.set(this.path, content); return true; }
     close() { this.closed = true; }
   }
+  Folder.userData='/UserData';
+  Folder.temp='/Temp';
+  folders.add('/Temp');
   class Window {
     add(type, bounds, items) {
       if (type === 'dropdownlist') {
@@ -314,8 +323,43 @@ function run(children, options = {}) {
   assert.ok(temps.every(temp => temp.closed), 'all temporary documents must be closed');
   const entry = [...files].find(([name]) => name.endsWith('_ui_data.json'));
   const json = entry && entry[1];
-  return { data: json && JSON.parse(json), alerts, files, pngs, folders, doc, temps, openedFolders };
+  const exportFiles = new Map([...files].filter(([name]) => !name.endsWith('.log')));
+  return { data: json && JSON.parse(json), alerts, files, exportFiles, pngs, folders, doc, temps, openedFolders };
 }
+
+test('fatal Photoshop errors produce a log with phase, full layer path and original error details', () => {
+  const result = run([group('Panel', [group('Labels', [text('Caption')])])], { failTextFont: true });
+  const entry = [...result.files].find(([name]) => name.endsWith('.log'));
+  assert.ok(entry, 'fatal exports need a diagnostic file');
+  assert.match(entry[1], /24\.3\.0/);
+  assert.match(entry[1], /Screen\.psd/);
+  assert.match(entry[1], /Panel\/Labels\/Caption/);
+  assert.match(entry[1], /读取文字字体/);
+  assert.match(entry[1], /8800/);
+  assert.match(entry[1], /456/);
+  assert.match(entry[1], /General Photoshop error/);
+  assert.ok(result.alerts.at(-1).includes(entry[0]));
+  assert.equal(result.data, undefined);
+});
+
+test('partial PNG errors are logged with their stage and destination, while successful exports create no logs', () => {
+  const result = run([group('Panel', [image('img_art')])], { failSave: true });
+  const entry = [...result.files].find(([name]) => name.endsWith('.log'));
+  assert.ok(entry);
+  assert.match(entry[1], /保存 PNG/);
+  assert.match(entry[1], /Panel\/img_art/);
+  assert.match(entry[1], /\/design\/Screen\/img_art\.png/);
+  assert.match(entry[1], /disk full/);
+  assert.match(result.alerts.at(-1), /导出部分完成/);
+  assert.ok(result.alerts.at(-1).includes(entry[0]));
+  assert.equal([...run([image('img_ok')]).files.keys()].some(name => name.endsWith('.log')), false);
+});
+
+test('unwritable log storage preserves the original error and reports the logging failure', () => {
+  const result = run([text('Caption')], { failTextFont: true, failLog: true });
+  assert.match(result.alerts.at(-1), /General Photoshop error/);
+  assert.match(result.alerts.at(-1), /日志写入失败/);
+});
 
 test('mixed stack traversal extracts nested sprites/text and skips hidden/ignored subtrees', () => {
   const result = run([
@@ -372,7 +416,7 @@ test('selected export requires a uniquely named ordinary top-level group', () =>
 });
 
 test('selected empty group fails before writing, while a text-only group reports its missing image naming', () => {
-  assert.equal(run([group('Empty',[])], {exportSelected:true}).files.size, 0);
+  assert.equal(run([group('Empty',[])], {exportSelected:true}).exportFiles.size, 0);
   const result=run([group('TextOnly',[text('Caption')])], {exportSelected:true});
   assert.equal(result.data.layers.length, 1);
   assert.match(result.alerts.at(-1), /本次仅导出文字/);
@@ -471,6 +515,32 @@ test('text preserves alignment, content/control characters, color and resolution
   assert.equal(result.pngs.size, 0);
 });
 
+test('unreadable text alignment defaults to center, warns and preserves the text layer', () => {
+  const result = run([group('Panel', [text('限定')])], {failJustification:true});
+  assert.equal(result.data?.layers[0].textAlignment, 'center');
+  assert.equal(result.data.layers[0].text, '内容');
+  assert.match(result.alerts.at(-1), /默认居中/);
+  assert.match(result.alerts.at(-1), /Panel\/限定/);
+  assert.doesNotMatch(result.alerts.at(-1), /导出失败/);
+});
+
+test('disabled layer effects never export a text stroke, even when frameFX itself remains enabled', () => {
+  const label = text('少女鹅');
+  label.descriptor.layerFXVisible = false;
+  label.descriptor.layerEffects = {frameFX:{enabled:true,size:3,color:rgb(0,0,0)}};
+  const result = run([label]);
+  assert.equal(result.data.layers[0].strokeColor, undefined);
+  assert.equal(result.data.layers[0].strokeWidth, undefined);
+});
+
+test('enabled text strokes preserve their Photoshop pixel width', () => {
+  const label = text('Stroke');
+  label.descriptor.layerEffects = {frameFX:{enabled:true,size:3,color:rgb(0,0,0)}};
+  const result = run([label]);
+  assert.equal(result.data.layers[0].strokeWidth, 3);
+  assert.equal(result.data.layers[0].strokeColor, '#000000');
+});
+
 test('text font size includes the Photoshop text transform exactly once', () => {
   const shopping = text('购物喽');
   shopping.text.size = 50.0800704956055;
@@ -509,7 +579,7 @@ test('cancel, no document and unsaved document exit without filesystem writes', 
 
 test('relative sprite paths cannot escape the export directory', () => {
   const result = run([image('../img_escape')]);
-  assert.equal(result.files.size, 0);
+  assert.equal(result.exportFiles.size, 0);
   assert.equal(result.temps.length, 0);
   assert.match(result.alerts.at(-1), /不能用作相对 PNG 路径/);
 });
@@ -552,7 +622,7 @@ test('downsampling retains an integer transparent border and compensates JSON la
 test('invalid node raster scales fail before any export file is created', () => {
   for (const suffix of ['0', '-0.5', '0.5junk', '', 'NaN']) {
     const result = run([image('img_bad^' + suffix)]);
-    assert.equal(result.files.size, 0);
+    assert.equal(result.exportFiles.size, 0);
     assert.equal(result.pngs.size, 0);
     assert.match(result.alerts.at(-1), /节点 PNG 倍率必须是正数/);
   }
@@ -560,7 +630,7 @@ test('invalid node raster scales fail before any export file is created', () => 
 
 test('legacy star marker is no longer parsed as a PNG multiplier', () => {
   const result = run([image('img_legacy*0.5')]);
-  assert.equal(result.files.size, 0);
+  assert.equal(result.exportFiles.size, 0);
   assert.match(result.alerts.at(-1), /不能用作相对 PNG 路径/);
 });
 
